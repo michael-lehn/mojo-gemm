@@ -11,12 +11,10 @@ def potrf_select[SME: Bool, ACC: Int](n: Int) -> Tuple[Int, Int, Int]:
     comptime if SME and ACC == 0:
         if n <= 75:  # pk, n >= 0
             return (1, 1, 0)
-        if n <= 1625:  # pk3, n >= 76
+        if n <= 2750:  # pk3, n >= 76
             return (2, 2, 0)
-        if n <= 2750:  # pk, n >= 1626
+        if n <= 3250:  # pk, n >= 2751
             return (1, 1, 0)
-        if n <= 3250:  # tiles, n >= 2751
-            return (0, 3, 384)
         if n <= 3750:  # tiles, n >= 3251
             return (0, 3, 256)
         return (0, 4, 256)  # tiles, n >= 3751

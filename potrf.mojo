@@ -219,6 +219,129 @@ def trilinv(n: Int, L: Ptr, incRowL: Int, incColL: Int, X: Ptr, d: Ptr):
             xl.unsafe_store(c0, SIMD[DType.float64, V](0.0))
 
 
+# Cholesky factorization of a full 32 x 32 diagonal block T (column major,
+# ld 32, lower) and, with INV, Linv = L^-1 (column major, ld 32, zeros
+# above the diagonal), fully unrolled.  T is copied into W on the stack by
+# rows, W(j, i) = T(i, j), so that the compiler keeps W in registers where
+# it can.  Gaussian elimination without pivoting on the upper triangle of W
+# (blocks of 8 rows, then rank-8 updates of the rows below): for a
+# symmetric matrix the multiplier m(i, l) = W(l, i) / W(l, l) is taken from
+# the pivot row.  At the end W(k, i) = D(k) L~(i, k) with A = L~ D L~^T, so
+#     L(i, k) = W(k, i) / sqrt(W(k, k)),
+#     row i of L~^-1 = e_i - sum_{l < i} m(i, l) (row l of L~^-1),
+#     L^-1 = D^-1/2 L~^-1,
+# and no square root is in the dependency chain.  L goes to the lower
+# triangle of Lout (column major, ld 32, may be T), only on success;
+# otherwise nothing is written and the info is returned.
+#
+# For a block of width bw < 32 the block is extended by the identity
+# (A + I, still positive definite): the entries of T outside bw x bw are
+# set to 0 and 1, and L is [L 0; 0 I] (written to Lout as well).
+@no_inline
+def diag32[INV: Bool](T: Ptr, Lout: Ptr, Linv: Ptr, bw: Int = 32) -> Int:
+    comptime N = 32
+    # padding in T (a work buffer): run-time indices into W would keep the
+    # compiler from holding W in registers
+    if bw < N:
+        for j in range(N):
+            for i in range(max(bw, j), N):
+                T[unsafe_offset=j * N + i] = 1.0 if i == j else 0.0
+    var Wb = Array[Float64, N * N](uninitialized=True)
+    var W = Wb.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+    comptime for j in range(N):
+        comptime for v in range(N // V):
+            W.unsafe_store(j * N + v * V, T.unsafe_load[width=V](j * N + v * V))
+    var rcp = Array[Float64, N](uninitialized=True)
+    comptime for K in range(N // V):
+        # elimination within block row K
+        comptime for k in range(V * K, V * K + V):
+            var p = W[unsafe_offset=k * (N + 1)]
+            if not (p > 0.0):
+                return k + 1
+            var r = 1.0 / p
+            rcp[k] = r
+            comptime for i in range(k + 1, V * K + V):
+                var m = W[unsafe_offset=k * N + i] * r
+                comptime for v in range(K, N // V):
+                    var o = i * N + v * V
+                    W.unsafe_store(
+                        o,
+                        W.unsafe_load[width=V](o)
+                        - m * W.unsafe_load[width=V](k * N + v * V),
+                    )
+        # rank-8 update of the rows below
+        comptime for i in range(V * K + V, N):
+            var m = SIMD[DType.float64, V](0.0)
+            comptime for l in range(V):
+                m[l] = W[unsafe_offset=(V * K + l) * N + i] * rcp[V * K + l]
+            comptime for v in range(i // V, N // V):
+                var o = i * N + v * V
+                var acc = W.unsafe_load[width=V](o)
+                comptime for l in range(V):
+                    acc -= m[l] * W.unsafe_load[width=V]((V * K + l) * N + v * V)
+                W.unsafe_store(o, acc)
+    comptime if INV:
+        # E = L~^-1 by rows (vectors up to the diagonal)
+        var Eb = Array[Float64, N * N](uninitialized=True)
+        var E = Eb.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+        comptime for i in range(N):
+            comptime for v in range(i // V + 1):
+                var acc = SIMD[DType.float64, V](0.0)
+                comptime if v == i // V:
+                    acc[i % V] = 1.0
+                comptime for l in range(V * v, i):
+                    var m = W[unsafe_offset=l * N + i] * rcp[l]
+                    acc -= m * E.unsafe_load[width=V](l * N + v * V)
+                E.unsafe_store(i * N + v * V, acc)
+        comptime for l in range(N):  # column l of Linv
+            comptime for j in range(N):
+                comptime if j < l:
+                    Linv[unsafe_offset=j + l * N] = 0.0
+                else:
+                    Linv[unsafe_offset=j + l * N] = (
+                        E[unsafe_offset=j * N + l] * sqrt(rcp[j])
+                    )
+    # L(i, k) = W(k, i) / sqrt(W(k, k)): column k of Lout, rows i >= k
+    comptime for k in range(N):
+        var s = sqrt(rcp[k])
+        comptime v0 = k // V
+        comptime for i in range(k, V * v0 + V):
+            Lout[unsafe_offset=k * N + i] = W[unsafe_offset=k * N + i] * s
+        comptime for v in range(v0 + 1, N // V):
+            Lout.unsafe_store(
+                k * N + v * V, s * W.unsafe_load[width=V](k * N + v * V)
+            )
+    return 0
+
+
+# Factorization (and with inv the inverse) of the diagonal block T of
+# width bw of potrf_pk; L goes to the lower triangle of D (the diagonal
+# block in the panels).  diag32 for bw > 24 (padded); potf2 and trilinv
+# otherwise and when diag32 fails (then potf2 gives LAPACK's info and the
+# partial factorization).
+def pk_diag(bw: Int, T: Ptr, D: Ptr, inv: Bool, Linv: Ptr, X: Ptr,
+            d: Ptr) -> Int:
+    # for bw <= 24 potf2 is faster than the padded 32 x 32 kernel
+    if bw > 24:
+        var info = diag32[True](T, D, Linv, bw) if inv else diag32[False](
+            T, D, Linv, bw
+        )
+        if info == 0:
+            return 0
+    var info = potf2[0](bw, T, 1, 32)
+    var t = 0
+    while t < 1024:
+        D.unsafe_store(t, T.unsafe_load[width=V](t))
+        t += V
+    if info != 0 or not inv:
+        return info
+    trilinv(32, T, 1, 32, X, d)
+    for j in range(32):
+        for l in range(32):
+            Linv[unsafe_offset=j + l * 32] = X[unsafe_offset=l + j * 32]
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Blocked BLAS operations on top of gemm
 # ---------------------------------------------------------------------------
@@ -535,16 +658,21 @@ def uptr(mut v: List[Float64]) -> Ptr:
 
 
 # potrf_pk: copy in the lower triangle of A (rows i0 .. i1-1 of each panel
-# column), zero elsewhere
+# column), zero elsewhere; block columns K0 .. K1-1 (default: all)
 def pk_copy_in(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
-               buf: Ptr):
-    for P in range(np):
+               buf: Ptr, K0: Int = 0, K1: Int = -1):
+    var k1 = np if K1 < 0 else K1
+    for P in range(K0, np):
         var base = buf.unsafe_offset(pk_offset(P))
-        for l in range(32 * (P + 1)):
+        for l in range(32 * K0, 32 * min(P + 1, k1)):
             var col = base.unsafe_offset(l * 32)
             var i0 = max(l - 32 * P, 0)
             var i1 = min(n - 32 * P, 32) if l < n else 0
             var src = A.unsafe_offset(32 * P * incRowA + l * incColA)
+            if incRowA == 1 and i0 == 0 and i1 == 32:  # full column
+                comptime for v in range(32 // V):
+                    col.unsafe_store(v * V, src.unsafe_load[width=V](v * V))
+                continue
             for i in range(0, 32, V):
                 col.unsafe_store(i, SIMD[DType.float64, V](0.0))
             if incRowA == 1:
@@ -560,16 +688,22 @@ def pk_copy_in(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
                     col[unsafe_offset=i] = src[unsafe_offset=i * incRowA]
 
 
-# potrf_pk: copy out the lower triangle
+# potrf_pk: copy out the lower triangle; block columns K0 .. K1-1 (default:
+# all)
 def pk_copy_out(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
-                buf: Ptr):
-    for P in range(np):
+                buf: Ptr, K0: Int = 0, K1: Int = -1):
+    var k1 = np if K1 < 0 else K1
+    for P in range(K0, np):
         var base = buf.unsafe_offset(pk_offset(P))
-        for l in range(min(32 * (P + 1), n)):
+        for l in range(32 * K0, min(32 * min(P + 1, k1), n)):
             var col = base.unsafe_offset(l * 32)
             var i0 = max(l - 32 * P, 0)
             var i1 = min(n - 32 * P, 32)
             var dst = A.unsafe_offset(32 * P * incRowA + l * incColA)
+            if incRowA == 1 and i0 == 0 and i1 == 32:  # full column
+                comptime for v in range(32 // V):
+                    dst.unsafe_store(v * V, col.unsafe_load[width=V](v * V))
+                continue
             if incRowA == 1:
                 var i = i0
                 while i + V <= i1:
@@ -587,7 +721,7 @@ def pk_copy_out(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
 # is copied once into panels of 32 rows (zero padded, so that all tiles are
 # full; see pk_offset), then for each block column K (32 columns):
 #     T(P) = C(P, K) - L(P, 0:32K) L(K, 0:32K)^T for P >= K   (pk_update)
-#     potf2 and trilinv on the diagonal block T(K)
+#     L(K, K) and its inverse from the diagonal block T(K)    (pk_diag)
 #     C(P, K) = T(P) L(K, K)^-T for P > K                    (pk_solve)
 # The kernels read the panels directly (no packing); the core touches only
 # the diagonal block of what the SME unit wrote.
@@ -623,21 +757,13 @@ def potrf_pk(n: Int, A: Ptr, incRowA: Int, incColA: Int,
                 while t < 1024:
                     dst.unsafe_store(t, src.unsafe_load[width=V](t))
                     t += V
-        # diagonal block: factor in T(K), copy to the panels
-        info = potf2[0](bw, T, 1, 32)
+        # diagonal block: L to the panels (and Linv)
         var D = buf.unsafe_offset(pk_offset(K) + K * 1024)
-        var t = 0
-        while t < 1024:
-            D.unsafe_store(t, T.unsafe_load[width=V](t))
-            t += V
+        info = pk_diag(bw, T, D, K + 1 < np, Linv, X, d)
         if info != 0:
             info += 32 * K
             break
         if K + 1 < np:  # then bw = 32
-            trilinv(32, T, 1, 32, X, d)
-            for j in range(32):
-                for l in range(32):
-                    Linv[unsafe_offset=j + l * 32] = X[unsafe_offset=l + j * 32]
             pk_solve(buf, T, Linv, K, np)
             fpsr_set(fpsr)
 
@@ -652,7 +778,7 @@ def potrf_pk(n: Int, A: Ptr, incRowA: Int, incColA: Int,
 #     thread 0, block column K:  solve (K+1, K); update (K+1, K+1); signal;
 #                                solve and update of the other panels;
 #                                wait for Linv(K+1)
-#     thread 1, K = 1, 2, ...:   wait; potf2 and trilinv of block K; signal
+#     thread 1, K = 1, 2, ...:   wait; pk_diag of block K; signal
 # T and Linv alternate between two buffers (K even / odd).
 @fieldwise_init
 struct PkShared(ImplicitlyCopyable):
@@ -666,6 +792,9 @@ struct PkShared(ImplicitlyCopyable):
     var X: Ptr
     var d: Ptr
     var flags: IPtr  # [diagonal blocks ready, diagonal blocks done, info]
+    var A: Ptr
+    var incRowA: Int
+    var incColA: Int
 
     def T(self, K: Int) -> Ptr:
         return self.T0 if K % 2 == 0 else self.T1
@@ -673,27 +802,16 @@ struct PkShared(ImplicitlyCopyable):
     def Linv(self, K: Int) -> Ptr:
         return self.L0 if K % 2 == 0 else self.L1
 
-    # potf2 and trilinv of diagonal block K (in T(K)); copies it to the
-    # panels.  Returns the info.
+    # factorization and inverse of diagonal block K (T(K), pk_diag), L
+    # to the panels.  Returns the info.
     def diag(self, K: Int) -> Int:
         var T = self.T(K)
         var bw = min(32, self.n - 32 * K)
-        var info = potf2[0](bw, T, 1, 32)
         var D = self.buf.unsafe_offset(pk_offset(K) + K * 1024)
-        var t = 0
-        while t < 1024:
-            D.unsafe_store(t, T.unsafe_load[width=V](t))
-            t += V
+        var info = pk_diag(bw, T, D, K + 1 < self.np, self.Linv(K), self.X,
+                           self.d)
         if info != 0:
             return info + 32 * K
-        if K + 1 < self.np:
-            trilinv(32, T, 1, 32, self.X, self.d)
-            var L = self.Linv(K)
-            for j in range(32):
-                for l in range(32):
-                    L[unsafe_offset=j + l * 32] = self.X[
-                        unsafe_offset=l + j * 32
-                    ]
         return 0
 
     def fail(self, info: Int):
@@ -719,8 +837,17 @@ struct PkShared(ImplicitlyCopyable):
             pk_update(self.buf, Tn, K + 1, self.np, K + 2)
         fpsr_set(fpsr)
 
+    # Besides the diagonal blocks the worker copies block column K+1 into
+    # the panels (needed from SME step K+1 on; published by the flag of
+    # diagonal block K, which the SME thread waits for) and block column
+    # K-2 back into A (final: the SME thread is past step K-2 when it
+    # signals diagonal block K).  The caller copies block columns 0 and 1
+    # in and the last two out.
     def core_work(self):
         for K in range(1, self.np):
+            if K + 1 < self.np:
+                pk_copy_in(self.n, self.np, self.A, self.incRowA,
+                           self.incColA, self.buf, K + 1, K + 2)
             while load(self.flags, 0) < K:
                 if load(self.flags, 2) != 0:
                     return
@@ -729,6 +856,9 @@ struct PkShared(ImplicitlyCopyable):
                 self.fail(info)
                 return
             increment(self.flags, 1)
+            if K >= 2:
+                pk_copy_out(self.n, self.np, self.A, self.incRowA,
+                            self.incColA, self.buf, K - 2, K - 1)
 
 
 # potrf_pk3: control block of the worker thread (Int64 entries): job
@@ -764,6 +894,8 @@ def pk_thread_main(arg: Int) abi("C") -> Int:
                 ptr_at(c, b + 5), ptr_at(c, b + 6), ptr_at(c, b + 7),
                 ptr_at(c, b + 8),
                 IPtr(unsafe_from_address=Int(c[unsafe_offset=b + 9])),
+                ptr_at(c, b + 10), Int(c[unsafe_offset=b + 11]),
+                Int(c[unsafe_offset=b + 12]),
             )
             g.core_work()
             increment(c, CTL_DONE)
@@ -790,9 +922,10 @@ def potrf_pk3(n: Int, A: Ptr, incRowA: Int, incColA: Int,
         pk.Linv2 = List[Float64](length=1024, fill=0.0)
     pk.start()
     var buf = uptr(pk.buf)
-    pk_copy_in(n, np, A, incRowA, incColA, buf)
+    pk_copy_in(n, np, A, incRowA, incColA, buf, 0, min(np, 2))
     var g = PkShared(n, np, buf, uptr(pk.T), uptr(pk.T2), uptr(pk.Linv),
-                     uptr(pk.Linv2), uptr(pk.X), uptr(pk.d), iptr(pk.flags))
+                     uptr(pk.Linv2), uptr(pk.X), uptr(pk.d), iptr(pk.flags),
+                     A, incRowA, incColA)
     for i in range(3):
         pk.flags[i] = 0
     var T = g.T(0)
@@ -818,13 +951,21 @@ def potrf_pk3(n: Int, A: Ptr, incRowA: Int, incColA: Int,
         c[unsafe_offset=b + 7] = Int64(Int(g.X))
         c[unsafe_offset=b + 8] = Int64(Int(g.d))
         c[unsafe_offset=b + 9] = Int64(Int(g.flags))
+        c[unsafe_offset=b + 10] = Int64(Int(A))
+        c[unsafe_offset=b + 11] = Int64(incRowA)
+        c[unsafe_offset=b + 12] = Int64(incColA)
         var job = load(c, CTL_JOB) + 1
         increment(c, CTL_JOB)  # publishes the job (sequentially consistent)
         g.sme_work()
         while load(c, CTL_DONE) < job:
             pass
         info = Int(pk.flags[2])
-    pk_copy_out(n, np, A, incRowA, incColA, buf)
+    if info == 0:  # the worker copied out block columns 0 .. np-3
+        pk_copy_out(n, np, A, incRowA, incColA, buf, max(np - 2, 0))
+    else:  # failed in block column (info-1)/32: columns up to two further
+        # on are in the panels, the others were never copied in
+        pk_copy_out(n, np, A, incRowA, incColA, buf, 0,
+                    min(np, (info - 1) // 32 + 2))
     return info
 
 
