@@ -3,17 +3,19 @@
 
 For each directory results/A-<order>_B-<order> (see run-benchmarks.sh):
 gflops-light.svg, gflops-dark.svg and table.md (time and GFLOP/s of the
-Mojo DGEMM).
+Mojo DGEMM).  With --float the same for results-float/ (SGEMM).
 """
 
 import pathlib
+import sys
 
 import matplotlib
 
 matplotlib.use("svg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-RESULTS = pathlib.Path(__file__).resolve().parent / "results"
+RESULTS = pathlib.Path(__file__).resolve().parent / (
+    "results-float" if "--float" in sys.argv[1:] else "results")
 
 # file -> (label, colour light, colour dark, line style).  The colour is
 # the implementation, the micro kernel is told apart by the height of the
@@ -70,8 +72,9 @@ def plot(d, theme, ymax):
 
     ax.annotate("SME2 micro kernels", xy=(4000, 0.9 * ymax), ha="right",
                 color=t["ink2"], fontsize=10)
-    ax.annotate("NEON micro kernels", xy=(4000, 0.16 * ymax), ha="right",
-                color=t["ink2"], fontsize=10)
+    neon = max(g for _, g in read(d / "mojo-neon.txt")[1].values())
+    ax.annotate("NEON micro kernels", xy=(4000, 1.25 * neon + 0.03 * ymax),
+                ha="right", color=t["ink2"], fontsize=10)
     ax.set_xlim(0, 4050)
     ax.set_ylim(0, ymax)
     ax.set_xlabel("m = n = k", color=t["ink2"])

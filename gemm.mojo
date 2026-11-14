@@ -1,4 +1,4 @@
-# DGEMM in Mojo: C <- beta C + alpha A B
+# GEMM in Mojo (double and float): C <- beta C + alpha A B
 #
 # The algorithm of BLIS and ulmBLAS:
 #
@@ -12,17 +12,22 @@
 # j*incColA], so column major (incRow = 1), row major (incCol = 1) and
 # matrices with other constant strides are all supported.
 #
-# Micro kernels: NEON (MR x NR = 8 x 6) in plain Mojo SIMD code below, SME2
-# (32 x 16) in ugemm_sme.mojo.  The caller selects one: gemm[SME=False] or
+# Micro kernels: NEON (MR x NR = 8 x 6 for double, 8 x 12 for float) in
+# plain Mojo SIMD code below, SME2 (32 x 16 for double, 32 x 32 for float)
+# in ugemm_sme.mojo.  The caller selects one: gemm[SME=False] or
 # gemm[SME=True] (SME2 requires an Apple M4, M5 or another CPU with SME2,
 # FEAT_SME_F64F64 and a streaming vector length of 512 bits).
 
 from std.math import ceildiv
 
-from ugemm_sme import ugemm_sme, mgemm_sme, MR_SME, NR_SME, fpsr_get, fpsr_set
+from ugemm_sme import (ugemm_sme, mgemm_sme, mgemm_sme32, MR_SME, NR_SME,
+                       fpsr_get, fpsr_set, PtrF, pack32_transpose)
 
 comptime f64 = DType.float64
-comptime Ptr = MutPointer[Float64, MutUntrackedOrigin]
+comptime f32 = DType.float32
+# pointer to elements of type dt; Ptr: double
+comptime PtrT[dt: DType] = MutPointer[Scalar[dt], MutUntrackedOrigin]
+comptime Ptr = PtrT[f64]
 
 # Block sizes of ulmBLAS for double on an Apple M5 (ulmblas/config/blocksize.h)
 @fieldwise_init
@@ -36,6 +41,15 @@ struct Config(ImplicitlyCopyable):
 
 comptime NEON = Config(960, 1024, 4080, 8, 6)
 comptime SME2 = Config(384, 1024, 1024, MR_SME, NR_SME)
+# float (ulmblas/config/blocksize.h)
+comptime NEON32 = Config(960, 1024, 4080, 8, 12)
+comptime SME2_32 = Config(512, 2048, 1024, 32, 32)
+
+
+def config[dt: DType, SME: Bool]() -> Config:
+    comptime if dt == f32:
+        return SME2_32 if SME else NEON32
+    return SME2 if SME else NEON
 
 comptime KUNROLL = 4  # unrolling of the loop over k in the NEON kernel
 comptime PV = 8  # SIMD width for packing partial panels
@@ -50,15 +64,23 @@ comptime PV = 8  # SIMD width for packing partial panels
 # alpha*A(p*MR + i, l) at A_[p*MR*kc + l*MR + i]; the last panel is zero
 # padded.  With alpha in the packed panels the micro kernel is called with
 # alpha = 1, which is the case of the direct path of the SME2 kernel.
-def pack_A[MR: Int](
-    mc: Int, kc: Int, alpha: Float64, A: Ptr, incRowA: Int, incColA: Int,
-    A_: Ptr,
+def pack_A[dt: DType, MR: Int](
+    mc: Int, kc: Int, alpha: Scalar[dt], A: PtrT[dt], incRowA: Int,
+    incColA: Int, A_: PtrT[dt],
 ):
     var mp = ceildiv(mc, MR)
     for p in range(mp):
         var P = A_.unsafe_offset(p * MR * kc)
         var i0 = p * MR
         var mr = min(MR, mc - i0)
+        comptime if dt == f32 and MR == 32:
+            # rows of A contiguous: transposed with ZA (SME2 kernel only)
+            if mr == MR and incColA == 1 and incRowA != 1 and alpha == 1.0:
+                pack32_transpose(
+                    kc, rebind[PtrF](A.unsafe_offset(i0 * incRowA)),
+                    incRowA, rebind[PtrF](P),
+                )
+                continue
         if mr == MR and incRowA == 1:
             for l in range(kc):
                 var a = A.unsafe_load[width=MR](i0 + l * incColA)
@@ -90,14 +112,22 @@ def pack_A[MR: Int](
 
 # B_ = kc x nc block of B in NR-column panels: panel q holds B(l, q*NR + j)
 # at B_[q*NR*kc + l*NR + j]; the last panel is zero padded.
-def pack_B[NR: Int](
-    kc: Int, nc: Int, B: Ptr, incRowB: Int, incColB: Int, B_: Ptr
+def pack_B[dt: DType, NR: Int](
+    kc: Int, nc: Int, B: PtrT[dt], incRowB: Int, incColB: Int, B_: PtrT[dt]
 ):
     var np = ceildiv(nc, NR)
     for q in range(np):
         var P = B_.unsafe_offset(q * NR * kc)
         var j0 = q * NR
         var nr = min(NR, nc - j0)
+        comptime if dt == f32 and NR == 32:
+            # columns of B contiguous: transposed with ZA (SME2 kernel only)
+            if nr == NR and incRowB == 1 and incColB != 1:
+                pack32_transpose(
+                    kc, rebind[PtrF](B.unsafe_offset(j0 * incColB)),
+                    incColB, rebind[PtrF](P),
+                )
+                continue
         comptime if NR & (NR - 1) == 0:  # SIMD width: a power of two
             if nr == NR and incColB == 1:
                 # rows of the panel are contiguous: SIMD loads
@@ -139,29 +169,29 @@ def pack_B[NR: Int](
 
 # One rank-1 update of the tile: acc[j] += A(:, l) * B(l, j).
 @always_inline
-def rank1[MR: Int, NR: Int](
-    l: Int, A: Ptr, B: Ptr, mut acc: Array[SIMD[f64, MR], NR]
+def rank1[dt: DType, MR: Int, NR: Int](
+    l: Int, A: PtrT[dt], B: PtrT[dt], mut acc: Array[SIMD[dt, MR], NR]
 ):
     var a = A.unsafe_load[width=MR](l * MR)
     comptime for j in range(NR):
         # an FMA with a broadcast element of B
-        acc[j] = a.fma(SIMD[f64, MR](B[unsafe_offset=l * NR + j]), acc[j])
+        acc[j] = a.fma(SIMD[dt, MR](B[unsafe_offset=l * NR + j]), acc[j])
 
 
-def ugemm[MR: Int, NR: Int, KU: Int = KUNROLL](
-    kc: Int, alpha: Float64, A: Ptr, B: Ptr, beta: Float64,
-    mr: Int, nr: Int, C: Ptr, incRowC: Int, incColC: Int,
+def ugemm[dt: DType, MR: Int, NR: Int, KU: Int = KUNROLL](
+    kc: Int, alpha: Scalar[dt], A: PtrT[dt], B: PtrT[dt], beta: Scalar[dt],
+    mr: Int, nr: Int, C: PtrT[dt], incRowC: Int, incColC: Int,
 ):
     # NR columns of the tile, each a SIMD vector of length MR
-    var acc = Array[SIMD[f64, MR], NR](fill=SIMD[f64, MR](0.0))
+    var acc = Array[SIMD[dt, MR], NR](fill=SIMD[dt, MR](0.0))
     # the loop over k, unrolled KU times at compile time
     var l = 0
     while l + KU <= kc:
         comptime for u in range(KU):
-            rank1[MR, NR](l + u, A, B, acc)
+            rank1[dt, MR, NR](l + u, A, B, acc)
         l += KU
     while l < kc:
-        rank1[MR, NR](l, A, B, acc)
+        rank1[dt, MR, NR](l, A, B, acc)
         l += 1
 
     if mr == MR and incRowC == 1:
@@ -189,14 +219,23 @@ def ugemm[MR: Int, NR: Int, KU: Int = KUNROLL](
 # ---------------------------------------------------------------------------
 
 
-def mgemm[MR: Int, NR: Int, SME: Bool](
-    mc: Int, nc: Int, kc: Int, alpha: Float64, A_: Ptr, B_: Ptr,
-    beta: Float64, C: Ptr, incRowC: Int, incColC: Int,
+def mgemm[dt: DType, MR: Int, NR: Int, SME: Bool](
+    mc: Int, nc: Int, kc: Int, alpha: Scalar[dt], A_: PtrT[dt],
+    B_: PtrT[dt], beta: Scalar[dt], C: PtrT[dt], incRowC: Int, incColC: Int,
 ):
     comptime if SME:
-        if alpha == 1.0:  # always the case: gemm puts alpha into A_
-            mgemm_sme(mc, nc, kc, A_, B_, beta, C, incRowC, incColC)
+        # alpha is always 1: gemm puts alpha into A_
+        comptime if dt == f32:
+            mgemm_sme32(mc, nc, kc, rebind[PtrF](A_), rebind[PtrF](B_),
+                        rebind[Float32](beta), rebind[PtrF](C), incRowC,
+                        incColC)
             return
+        else:
+            if alpha == 1.0:
+                mgemm_sme(mc, nc, kc, rebind[Ptr](A_), rebind[Ptr](B_),
+                          rebind[Float64](beta), rebind[Ptr](C), incRowC,
+                          incColC)
+                return
     var jr = 0
     while jr < nc:
         var nr = min(NR, nc - jr)
@@ -207,12 +246,14 @@ def mgemm[MR: Int, NR: Int, SME: Bool](
             var Bp = B_.unsafe_offset(jr * kc)
             var Cp = C.unsafe_offset(ir * incRowC + jr * incColC)
             # the micro kernel is chosen at compile time
-            comptime if SME:
+            comptime if SME and dt == f64:
                 ugemm_sme(
-                    kc, alpha, Ap, Bp, beta, mr, nr, Cp, incRowC, incColC
+                    kc, rebind[Float64](alpha), rebind[Ptr](Ap),
+                    rebind[Ptr](Bp), rebind[Float64](beta), mr, nr,
+                    rebind[Ptr](Cp), incRowC, incColC,
                 )
             else:
-                ugemm[MR, NR](
+                ugemm[dt, MR, NR](
                     kc, alpha, Ap, Bp, beta, mr, nr, Cp, incRowC, incColC
                 )
             ir += MR
@@ -226,30 +267,30 @@ def mgemm[MR: Int, NR: Int, SME: Bool](
 
 # The packing buffers, owned by the caller and reused across calls (no
 # allocation per call once they are large enough).
-struct Workspace(Movable):
-    var A_: List[Float64]
-    var B_: List[Float64]
+struct Workspace[dt: DType = f64](Movable):
+    var A_: List[Scalar[Self.dt]]
+    var B_: List[Scalar[Self.dt]]
 
     def __init__(out self):
-        self.A_ = List[Float64]()
-        self.B_ = List[Float64]()
+        self.A_ = List[Scalar[Self.dt]]()
+        self.B_ = List[Scalar[Self.dt]]()
 
     def reserve(mut self, lenA: Int, lenB: Int):
         if len(self.A_) < lenA:
-            self.A_ = List[Float64](length=lenA, fill=0.0)
+            self.A_ = List[Scalar[Self.dt]](length=lenA, fill=0.0)
         if len(self.B_) < lenB:
-            self.B_ = List[Float64](length=lenB, fill=0.0)
+            self.B_ = List[Scalar[Self.dt]](length=lenB, fill=0.0)
 
-    def ptr_A(mut self) -> Ptr:
+    def ptr_A(mut self) -> PtrT[Self.dt]:
         return self.A_.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
 
-    def ptr_B(mut self) -> Ptr:
+    def ptr_B(mut self) -> PtrT[Self.dt]:
         return self.B_.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
 
 
 # C <- beta C (beta == 0: C is set to zero without being read)
-def gescal(m: Int, n: Int, beta: Float64, C: Ptr, incRowC: Int,
-           incColC: Int):
+def gescal[dt: DType](m: Int, n: Int, beta: Scalar[dt], C: PtrT[dt],
+                     incRowC: Int, incColC: Int):
     if beta == 1.0:
         return
     for j in range(n):
@@ -258,14 +299,14 @@ def gescal(m: Int, n: Int, beta: Float64, C: Ptr, incRowC: Int,
             cij[] = 0.0 if beta == 0.0 else beta * cij[]
 
 
-def gemm[SME: Bool](
-    m: Int, n: Int, k: Int, alpha: Float64,
-    A: Ptr, incRowA: Int, incColA: Int,
-    B: Ptr, incRowB: Int, incColB: Int,
-    beta: Float64, C: Ptr, incRowC: Int, incColC: Int,
-    mut ws: Workspace,
+def gemm[SME: Bool, dt: DType = f64](
+    m: Int, n: Int, k: Int, alpha: Scalar[dt],
+    A: PtrT[dt], incRowA: Int, incColA: Int,
+    B: PtrT[dt], incRowB: Int, incColB: Int,
+    beta: Scalar[dt], C: PtrT[dt], incRowC: Int, incColC: Int,
+    mut ws: Workspace[dt],
 ):
-    comptime c = SME2 if SME else NEON
+    comptime c = config[dt, SME]()
     comptime MC = c.MC
     comptime KC = c.KC
     comptime NC = c.NC
@@ -277,7 +318,7 @@ def gemm[SME: Bool](
     # stores the tile of C column by column).  If C is closer to row major,
     # compute C^T = B^T A^T instead, as in BLIS.
     if abs(incRowC) > abs(incColC):
-        gemm[SME](
+        gemm[SME, dt](
             n, m, k, alpha, B, incColB, incRowB, A, incColA, incRowA,
             beta, C, incColC, incRowC, ws,
         )
@@ -318,19 +359,19 @@ def gemm[SME: Bool](
         while pc < k:
             var kc = min(KC, k - pc)
             var beta_ = beta0 if pc == 0 else 1.0
-            pack_B[NR](
+            pack_B[dt, NR](
                 kc, nc, B.unsafe_offset(pc * incRowB + jc * incColB),
                 incRowB, incColB, B_,
             )
             var ic = 0
             while ic < m:
                 var mc = min(MC, m - ic)
-                pack_A[MR](
+                pack_A[dt, MR](
                     mc, kc, alpha, A.unsafe_offset(ic * incRowA + pc * incColA),
                     incRowA, incColA, A_,
                 )
                 # alpha is in A_
-                mgemm[MR, NR, SME](
+                mgemm[dt, MR, NR, SME](
                     mc, nc, kc, 1.0, A_, B_, beta_,
                     C.unsafe_offset(ic * incRowC + jc * incColC),
                     incRowC, incColC,

@@ -1,12 +1,12 @@
-# Benchmark of DGEMM: C <- beta C + alpha A B, m = n = k.
+# Benchmark of DGEMM or SGEMM (--float): C <- beta C + alpha A B, m = n = k.
 #
-#   ./bench IMPL [--alpha=X] [--beta=X] [--A=row|col] [--B=row|col]
-#                [--C=row|col] [n ...]
+#   ./bench IMPL [--float] [--alpha=X] [--beta=X] [--A=row|col]
+#                [--B=row|col] [--C=row|col] [n ...]
 #
 #   IMPL   neon        Mojo, NEON micro kernel
 #          sme         Mojo, SME2 micro kernel
-#          PATH        cblas_dgemm of the shared library PATH (e.g. Apple
-#                      Accelerate or ulmBLAS), for comparison
+#          PATH        cblas_dgemm (cblas_sgemm) of the shared library PATH
+#                      (e.g. Apple Accelerate or ulmBLAS), for comparison
 #   defaults: alpha = 1, beta = 0, A, B and C row major,
 #             n = 50, 100, ..., 4000
 #
@@ -23,7 +23,7 @@ from std.random import random_float64, random_ui64, seed
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from gemm import NEON, SME2, Ptr, Workspace, gemm
+from gemm import PtrT, Workspace, config, gemm
 
 comptime ACCELERATE = (
     "/System/Library/Frameworks/Accelerate.framework/Accelerate"
@@ -35,13 +35,13 @@ comptime CblasNoTrans = Int32(111)
 comptime CblasTrans = Int32(112)
 
 
-def raw(mut A: List[Float64]) -> Ptr:
+def raw[dt: DType](mut A: List[Scalar[dt]]) -> PtrT[dt]:
     return A.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
 
 
 # "C = A*B", "C = C + A*B", "C = 0.5*C + 2.0*A*B", ...
-def title(alpha: Float64, beta: Float64, row_A: Bool, row_B: Bool,
-          row_C: Bool) -> String:
+def title(single: Bool, alpha: Float64, beta: Float64, row_A: Bool,
+          row_B: Bool, row_C: Bool) -> String:
     var ab = String("A*B") if alpha == 1.0 else String(alpha, "*A*B")
     var s = String("C = ")
     if beta == 1.0:
@@ -54,15 +54,15 @@ def title(alpha: Float64, beta: Float64, row_A: Bool, row_B: Bool,
         return "row major" if row else "col major"
 
     return String(
-        "DGEMM ", s, ", A ", order(row_A), ", B ", order(row_B), ", C ",
-        order(row_C),
+        "SGEMM " if single else "DGEMM ", s, ", A ", order(row_A), ", B ",
+        order(row_B), ", C ", order(row_C),
     )
 
 
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: bench neon|sme|PATH [--alpha=X] [--beta=X]",
+        print("usage: bench neon|sme|PATH [--float] [--alpha=X] [--beta=X]",
               "[--A=row|col] [--B=row|col] [--C=row|col] [n ...]")
         return
     var impl = String(args[1])
@@ -72,9 +72,12 @@ def main() raises:
     var row_B = True
     var row_C = True
     var sizes = List[Int]()
+    var single = False
     for i in range(2, len(args)):
         var a = String(args[i])
-        if a.startswith("--alpha="):
+        if a == "--float":
+            single = True
+        elif a.startswith("--alpha="):
             alpha = atof(a[byte=8:])
         elif a.startswith("--beta="):
             beta = atof(a[byte=7:])
@@ -101,38 +104,50 @@ def main() raises:
         UInt32(0x21), Int32(0)
     )
 
-    # kind: 0 Mojo NEON, 1 Mojo SME2, 2 cblas_dgemm of a shared library
+    print("#", title(single, alpha, beta, row_A, row_B, row_C))
+    if single:
+        run[DType.float32](impl, alpha, beta, row_A, row_B, row_C, sizes)
+    else:
+        run[DType.float64](impl, alpha, beta, row_A, row_B, row_C, sizes)
+
+
+def run[dt: DType](
+    impl: String, alpha_: Float64, beta_: Float64, row_A: Bool, row_B: Bool,
+    row_C: Bool, sizes: List[Int],
+) raises:
+    var alpha = Scalar[dt](alpha_)
+    var beta = Scalar[dt](beta_)
+    comptime name = "cblas_sgemm" if dt == DType.float32 else "cblas_dgemm"
+    # kind: 0 Mojo NEON, 1 Mojo SME2, 2 cblas_?gemm of a shared library
     var kind = 0 if impl == "neon" else (1 if impl == "sme" else 2)
     var lib = OwnedDLHandle(impl if kind == 2 else String(ACCELERATE))
-    var cblas_dgemm = lib.get_function[NoneType]("cblas_dgemm")
+    var cblas_gemm = lib.get_function[NoneType](name)
 
-    print("#", title(alpha, beta, row_A, row_B, row_C))
-    if kind == 0:
-        print(String("# Mojo, NEON micro kernel, MR x NR = ", NEON.MR, " x ",
-                     NEON.NR, ", MC KC NC = ", NEON.MC, " ", NEON.KC, " ",
-                     NEON.NC))
-    elif kind == 1:
-        print(String("# Mojo, SME2 micro kernel, MR x NR = ", SME2.MR, " x ",
-                     SME2.NR, ", MC KC NC = ", SME2.MC, " ", SME2.KC, " ",
-                     SME2.NC))
+    if kind < 2:
+        comptime cN = config[dt, False]()
+        comptime cS = config[dt, True]()
+        var c = cS if kind == 1 else cN
+        print(String("# Mojo, ", "SME2" if kind == 1 else "NEON",
+                     " micro kernel, MR x NR = ", c.MR, " x ", c.NR,
+                     ", MC KC NC = ", c.MC, " ", c.KC, " ", c.NC))
     else:
         var backend = getenv("ULMBLAS_BACKEND")
         var slash = impl.rfind("/")  # only the file name of the library
-        print(String("# cblas_dgemm of ", impl[byte=slash + 1 :],
+        print(String("# ", name, " of ", impl[byte=slash + 1 :],
                      "" if backend == "" else String(", ULMBLAS_BACKEND=",
                                                       backend)))
     print("# n seconds GFLOP/s check")
 
     seed(1)
-    var ws = Workspace()
+    var ws = Workspace[dt]()
     for n in sizes:
-        var A = List[Float64](length=n * n, fill=0.0)
-        var B = List[Float64](length=n * n, fill=0.0)
-        var C = List[Float64](length=n * n, fill=0.0)
+        var A = List[Scalar[dt]](length=n * n, fill=0.0)
+        var B = List[Scalar[dt]](length=n * n, fill=0.0)
+        var C = List[Scalar[dt]](length=n * n, fill=0.0)
         for i in range(n * n):
-            A[i] = random_float64(-1.0, 1.0)
-            B[i] = random_float64(-1.0, 1.0)
-            C[i] = random_float64(-1.0, 1.0)
+            A[i] = Scalar[dt](random_float64(-1.0, 1.0))
+            B[i] = Scalar[dt](random_float64(-1.0, 1.0))
+            C[i] = Scalar[dt](random_float64(-1.0, 1.0))
         var C0 = C.copy()
         # strides of the square matrices
         var incRowA = n if row_A else 1
@@ -157,17 +172,17 @@ def main() raises:
             var elapsed = 0.0
             while elapsed < min_time:
                 if kind == 0:
-                    gemm[False](
+                    gemm[False, dt](
                         n, n, n, alpha, raw(A), incRowA, incColA, raw(B),
                         incRowB, incColB, beta, raw(C), incRowC, incColC, ws,
                     )
                 elif kind == 1:
-                    gemm[True](
+                    gemm[True, dt](
                         n, n, n, alpha, raw(A), incRowA, incColA, raw(B),
                         incRowB, incColB, beta, raw(C), incRowC, incColC, ws,
                     )
                 else:
-                    cblas_dgemm(
+                    cblas_gemm(
                         layout, transA, transB, Int32(n), Int32(n), Int32(n),
                         alpha, raw(A), Int32(n), raw(B), Int32(n), beta,
                         raw(C), Int32(n),
@@ -186,30 +201,37 @@ def main() raises:
 
 
 # 400 random elements of C = beta C0 + alpha A B against sums with the
-# error bound 4 (k + 2) eps (|alpha| sum |A(i,l) B(l,j)| + |beta C0(i,j)|).
-def check(
-    n: Int, alpha: Float64, beta: Float64,
-    A: List[Float64], incRowA: Int, incColA: Int,
-    B: List[Float64], incRowB: Int, incColB: Int,
-    C0: List[Float64], C: List[Float64], incRowC: Int, incColC: Int,
+# error bound 4 (k + 2) eps (|alpha| sum |A(i,l) B(l,j)| + |beta C0(i,j)|),
+# in double, eps of the element type.
+def check[dt: DType](
+    n: Int, alpha_: Scalar[dt], beta_: Scalar[dt],
+    A: List[Scalar[dt]], incRowA: Int, incColA: Int,
+    B: List[Scalar[dt]], incRowB: Int, incColB: Int,
+    C0: List[Scalar[dt]], C: List[Scalar[dt]], incRowC: Int, incColC: Int,
 ) -> Bool:
-    comptime eps = 2.220446049250313e-16
+    var alpha = Float64(alpha_)
+    var beta = Float64(beta_)
+    comptime eps = 2.220446049250313e-16 if dt == DType.float64 else (
+        1.1920928955078125e-07
+    )
     for _ in range(400):
         var i = Int(random_ui64(0, UInt64(n - 1)))
         var j = Int(random_ui64(0, UInt64(n - 1)))
         var s = 0.0
         var bound = 0.0
         for l in range(n):
-            var p = A[i * incRowA + l * incColA] * B[l * incRowB + j * incColB]
+            var p = Float64(A[i * incRowA + l * incColA]) * Float64(
+                B[l * incRowB + j * incColB]
+            )
             s += p
             bound += abs(p)
         var cij = alpha * s
         bound = abs(alpha) * bound
         if beta != 0.0:
-            var c0 = C0[i * incRowC + j * incColC]
+            var c0 = Float64(C0[i * incRowC + j * incColC])
             cij += beta * c0
             bound += abs(beta * c0)
-        if abs(C[i * incRowC + j * incColC] - cij) > 4.0 * Float64(
+        if abs(Float64(C[i * incRowC + j * incColC]) - cij) > 4.0 * Float64(
             n + 2
         ) * eps * bound:
             return False

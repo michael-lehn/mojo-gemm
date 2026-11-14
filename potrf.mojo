@@ -1,5 +1,6 @@
-# DPOTRF in Mojo: Cholesky factorization A = L L^T (or A = U^T U) of a
-# symmetric positive definite matrix, in place, with general strides.  The
+# DPOTRF and SPOTRF in Mojo (parameter dt: double or float): Cholesky
+# factorization A = L L^T (or A = U^T U) of a symmetric positive definite
+# matrix, in place, with general strides.  The
 # upper case is the lower one on the transposed view (strides swapped).
 #
 # BLAS backend (parameter ACC): 0 the Mojo BLAS (gemm.mojo, level12.mojo,
@@ -34,12 +35,15 @@ from std.math import ceildiv, sqrt
 
 from max.algorithm import sync_parallelize
 
-from gemm import Ptr, Workspace, gemm
-from ugemm_sme import fpsr_get, fpsr_set, pk_offset, pk_solve, pk_update
+from gemm import Ptr, PtrT, Workspace, gemm
+from ugemm_sme import (fpsr_get, fpsr_set, pk_offset, pk_solve, pk_update,
+                       pk_solve32, pk_update32, PtrF)
 from level12 import V, dot, gemv, scal
 from potrf_select import potrf_select
 
 comptime IPtr = MutPointer[Int64, MutUntrackedOrigin]
+comptime f64 = DType.float64
+comptime f32 = DType.float32
 
 # base block: unblocked potf2 below it, and the size of the diagonal blocks
 # of TRSM that are inverted explicitly
@@ -50,22 +54,22 @@ comptime SB = 64
 
 # Buffers of one thread: the packing buffers of gemm, the buffer of the
 # diagonal blocks of syrk_ln and the reciprocals of trilinv.
-struct Buffers(Movable):
-    var ws: Workspace
-    var T: List[Float64]
-    var d: List[Float64]
+struct Buffers[dt: DType](Movable):
+    var ws: Workspace[Self.dt]
+    var T: List[Scalar[Self.dt]]
+    var d: List[Scalar[Self.dt]]
 
     def __init__(out self):
-        self.ws = Workspace()
-        self.T = List[Float64]()
-        self.d = List[Float64](length=IB, fill=0.0)
+        self.ws = Workspace[Self.dt]()
+        self.T = List[Scalar[Self.dt]]()
+        self.d = List[Scalar[Self.dt]](length=IB, fill=0.0)
 
-    def tmp(mut self, size: Int) -> Ptr:
+    def tmp(mut self, size: Int) -> PtrT[Self.dt]:
         if len(self.T) < size:
-            self.T = List[Float64](length=size, fill=0.0)
+            self.T = List[Scalar[Self.dt]](length=size, fill=0.0)
         return self.T.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
 
-    def ptr_d(mut self) -> Ptr:
+    def ptr_d(mut self) -> PtrT[Self.dt]:
         return self.d.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
 
 
@@ -73,10 +77,10 @@ struct Buffers(Movable):
 # BLAS backend, the parameter ACC of potrf:
 #   ACC = 0: Mojo: level 3 below on top of gemm.mojo (NEON or SME2 micro
 #            kernel), level 1 and 2 in level12.mojo
-#   ACC = 1: BLAS of Apple Accelerate (level 3: cblas_dtrsm, cblas_dsyrk,
-#            cblas_dgemm; level 1 and 2 in potf2: cblas_ddot, cblas_dgemv,
-#            cblas_dscal; link with -framework Accelerate), for column or row
-#            major A.
+#   ACC = 1: BLAS of Apple Accelerate (level 3: cblas_?trsm, cblas_?syrk,
+#            cblas_?gemm; level 1 and 2 in potf2: cblas_?dot, cblas_?gemv,
+#            cblas_?scal, ? = d or s; link with -framework Accelerate), for
+#            column or row major A.
 # Everything else (tiles, task graph, recursive factorization of the
 # diagonal tiles, potf2) is the same for both.
 # ---------------------------------------------------------------------------
@@ -99,55 +103,65 @@ def cblas_layout(incRow: Int, incCol: Int) -> Tuple[Int32, Int32]:
 
 
 # B <- B L^-T: B is m x n, L is n x n lower triangular
-def acc_trsm(m: Int, n: Int, L: Ptr, B: Ptr, incRow: Int, incCol: Int):
+def acc_trsm[dt: DType](m: Int, n: Int, L: PtrT[dt], B: PtrT[dt],
+                       incRow: Int, incCol: Int):
     var o = cblas_layout(incRow, incCol)
-    external_call["cblas_dtrsm", NoneType](
+    comptime name = "cblas_strsm" if dt == f32 else "cblas_dtrsm"
+    external_call[name, NoneType](
         o[0], CblasRight, CblasLower, CblasTrans, CblasNonUnit, Int32(m),
-        Int32(n), 1.0, L, o[1], B, o[1],
+        Int32(n), Scalar[dt](1.0), L, o[1], B, o[1],
     )
 
 
 # lower triangle of C -= A A^T: C is n x n, A is n x k
-def acc_syrk(n: Int, k: Int, A: Ptr, C: Ptr, incRow: Int, incCol: Int):
+def acc_syrk[dt: DType](n: Int, k: Int, A: PtrT[dt], C: PtrT[dt],
+                       incRow: Int, incCol: Int):
     var o = cblas_layout(incRow, incCol)
-    external_call["cblas_dsyrk", NoneType](
-        o[0], CblasLower, CblasNoTrans, Int32(n), Int32(k), -1.0, A, o[1],
-        1.0, C, o[1],
+    comptime name = "cblas_ssyrk" if dt == f32 else "cblas_dsyrk"
+    external_call[name, NoneType](
+        o[0], CblasLower, CblasNoTrans, Int32(n), Int32(k), Scalar[dt](-1.0),
+        A, o[1], Scalar[dt](1.0), C, o[1],
     )
 
 
 # C -= A B^T: C is m x n, A is m x k, B is n x k
-def acc_gemm(m: Int, n: Int, k: Int, A: Ptr, B: Ptr, C: Ptr, incRow: Int,
-             incCol: Int):
+def acc_gemm[dt: DType](m: Int, n: Int, k: Int, A: PtrT[dt], B: PtrT[dt],
+                       C: PtrT[dt], incRow: Int, incCol: Int):
     var o = cblas_layout(incRow, incCol)
-    external_call["cblas_dgemm", NoneType](
-        o[0], CblasNoTrans, CblasTrans, Int32(m), Int32(n), Int32(k), -1.0, A,
-        o[1], B, o[1], 1.0, C, o[1],
+    comptime name = "cblas_sgemm" if dt == f32 else "cblas_dgemm"
+    external_call[name, NoneType](
+        o[0], CblasNoTrans, CblasTrans, Int32(m), Int32(n), Int32(k),
+        Scalar[dt](-1.0), A, o[1], B, o[1], Scalar[dt](1.0), C, o[1],
     )
 
 
 # x^T y
-def acc_dot(n: Int, x: Ptr, incX: Int, y: Ptr, incY: Int) -> Float64:
-    return external_call["cblas_ddot", Float64](
+def acc_dot[dt: DType](n: Int, x: PtrT[dt], incX: Int, y: PtrT[dt],
+                      incY: Int) -> Scalar[dt]:
+    comptime name = "cblas_sdot" if dt == f32 else "cblas_ddot"
+    return external_call[name, Scalar[dt]](
         Int32(n), x, Int32(incX), y, Int32(incY)
     )
 
 
 # y -= A x: A is m x n with strides (incRow, incCol), one of them 1
-def acc_gemv(m: Int, n: Int, A: Ptr, incRow: Int, incCol: Int, x: Ptr,
-             incX: Int, y: Ptr, incY: Int):
+def acc_gemv[dt: DType](m: Int, n: Int, A: PtrT[dt], incRow: Int,
+                       incCol: Int, x: PtrT[dt], incX: Int, y: PtrT[dt],
+                       incY: Int):
     if n == 0:
         return
     var o = cblas_layout(incRow, incCol)
-    external_call["cblas_dgemv", NoneType](
-        o[0], CblasNoTrans, Int32(m), Int32(n), -1.0, A, o[1], x,
-        Int32(incX), 1.0, y, Int32(incY),
+    comptime name = "cblas_sgemv" if dt == f32 else "cblas_dgemv"
+    external_call[name, NoneType](
+        o[0], CblasNoTrans, Int32(m), Int32(n), Scalar[dt](-1.0), A, o[1], x,
+        Int32(incX), Scalar[dt](1.0), y, Int32(incY),
     )
 
 
 # x *= alpha
-def acc_scal(n: Int, alpha: Float64, x: Ptr, incX: Int):
-    external_call["cblas_dscal", NoneType](Int32(n), alpha, x, Int32(incX))
+def acc_scal[dt: DType](n: Int, alpha: Scalar[dt], x: PtrT[dt], incX: Int):
+    comptime name = "cblas_sscal" if dt == f32 else "cblas_dscal"
+    external_call[name, NoneType](Int32(n), alpha, x, Int32(incX))
 
 
 # ---------------------------------------------------------------------------
@@ -165,14 +179,16 @@ def acc_scal(n: Int, alpha: Float64, x: Ptr, incX: Int):
 # Returns 0, or j + 1 if the leading minor of order j + 1 is not positive
 # definite.
 @no_inline
-def potf2[ACC: Int](n: Int, A: Ptr, incRowA: Int, incColA: Int) -> Int:
+def potf2[ACC: Int, dt: DType = f64](
+    n: Int, A: PtrT[dt], incRowA: Int, incColA: Int
+) -> Int:
     for j in range(n):
         var Aj = A.unsafe_offset(j * incRowA)  # row j
         var ajj = A[unsafe_offset=j * (incRowA + incColA)]
         comptime if ACC == 1:
-            ajj -= acc_dot(j, Aj, incColA, Aj, incColA)
+            ajj -= acc_dot[dt](j, Aj, incColA, Aj, incColA)
         else:
-            ajj -= dot(j, Aj, incColA, Aj, incColA)
+            ajj -= dot[dt](j, Aj, incColA, Aj, incColA)
         if not (ajj > 0.0):  # also catches NaN
             A[unsafe_offset=j * (incRowA + incColA)] = ajj
             return j + 1
@@ -184,11 +200,11 @@ def potf2[ACC: Int](n: Int, A: Ptr, incRowA: Int, incColA: Int) -> Int:
         var A2 = A.unsafe_offset((j + 1) * incRowA)  # A(j+1:n, 0:j)
         var a = A2.unsafe_offset(j * incColA)  # A(j+1:n, j)
         comptime if ACC == 1:
-            acc_gemv(m, j, A2, incRowA, incColA, Aj, incColA, a, incRowA)
-            acc_scal(m, 1.0 / ajj, a, incRowA)
+            acc_gemv[dt](m, j, A2, incRowA, incColA, Aj, incColA, a, incRowA)
+            acc_scal[dt](m, 1.0 / ajj, a, incRowA)
         else:
-            gemv(m, j, -1.0, A2, incRowA, incColA, Aj, incColA, a, incRowA)
-            scal(m, 1.0 / ajj, a, incRowA)
+            gemv[dt](m, j, -1.0, A2, incRowA, incColA, Aj, incColA, a, incRowA)
+            scal[dt](m, 1.0 / ajj, a, incRowA)
     return 0
 
 
@@ -198,7 +214,8 @@ def potf2[ACC: Int](n: Int, A: Ptr, incRowA: Int, incColA: Int) -> Int:
 # V elements up to column ceil(n / V) V; the reciprocals of the diagonal go
 # to d.
 @no_inline
-def trilinv(n: Int, L: Ptr, incRowL: Int, incColL: Int, X: Ptr, d: Ptr):
+def trilinv[dt: DType](n: Int, L: PtrT[dt], incRowL: Int, incColL: Int,
+                       X: PtrT[dt], d: PtrT[dt]):
     var ne = (n + V - 1) // V * V
     for l in range(n):
         d[unsafe_offset=l] = 1.0 / L[unsafe_offset=l * (incRowL + incColL)]
@@ -206,7 +223,7 @@ def trilinv(n: Int, L: Ptr, incRowL: Int, incColL: Int, X: Ptr, d: Ptr):
         var xl = X.unsafe_offset(l * IB)
         var ce = (l + V) // V * V  # ceil((l + 1) / V) V
         for c0 in range(0, ce, V):
-            var acc = SIMD[DType.float64, V](0.0)
+            var acc = SIMD[dt, V](0.0)
             if c0 <= l < c0 + V:
                 acc[l - c0] = 1.0
             # X(m, c) = 0 for c > m: rows m < c0 do not contribute
@@ -216,7 +233,7 @@ def trilinv(n: Int, L: Ptr, incRowL: Int, incColL: Int, X: Ptr, d: Ptr):
                 )
             xl.unsafe_store(c0, acc * d[unsafe_offset=l])
         for c0 in range(ce, ne, V):
-            xl.unsafe_store(c0, SIMD[DType.float64, V](0.0))
+            xl.unsafe_store(c0, SIMD[dt, V](0.0))
 
 
 # Cholesky factorization of a full 32 x 32 diagonal block T (column major,
@@ -238,7 +255,9 @@ def trilinv(n: Int, L: Ptr, incRowL: Int, incColL: Int, X: Ptr, d: Ptr):
 # (A + I, still positive definite): the entries of T outside bw x bw are
 # set to 0 and 1, and L is [L 0; 0 I] (written to Lout as well).
 @no_inline
-def diag32[INV: Bool](T: Ptr, Lout: Ptr, Linv: Ptr, bw: Int = 32) -> Int:
+def diag32[INV: Bool, dt: DType = f64](
+    T: PtrT[dt], Lout: PtrT[dt], Linv: PtrT[dt], bw: Int = 32
+) -> Int:
     comptime N = 32
     # padding in T (a work buffer): run-time indices into W would keep the
     # compiler from holding W in registers
@@ -246,12 +265,12 @@ def diag32[INV: Bool](T: Ptr, Lout: Ptr, Linv: Ptr, bw: Int = 32) -> Int:
         for j in range(N):
             for i in range(max(bw, j), N):
                 T[unsafe_offset=j * N + i] = 1.0 if i == j else 0.0
-    var Wb = Array[Float64, N * N](uninitialized=True)
+    var Wb = Array[Scalar[dt], N * N](uninitialized=True)
     var W = Wb.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
     comptime for j in range(N):
         comptime for v in range(N // V):
             W.unsafe_store(j * N + v * V, T.unsafe_load[width=V](j * N + v * V))
-    var rcp = Array[Float64, N](uninitialized=True)
+    var rcp = Array[Scalar[dt], N](uninitialized=True)
     comptime for K in range(N // V):
         # elimination within block row K
         comptime for k in range(V * K, V * K + V):
@@ -271,7 +290,7 @@ def diag32[INV: Bool](T: Ptr, Lout: Ptr, Linv: Ptr, bw: Int = 32) -> Int:
                     )
         # rank-8 update of the rows below
         comptime for i in range(V * K + V, N):
-            var m = SIMD[DType.float64, V](0.0)
+            var m = SIMD[dt, V](0.0)
             comptime for l in range(V):
                 m[l] = W[unsafe_offset=(V * K + l) * N + i] * rcp[V * K + l]
             comptime for v in range(i // V, N // V):
@@ -282,11 +301,11 @@ def diag32[INV: Bool](T: Ptr, Lout: Ptr, Linv: Ptr, bw: Int = 32) -> Int:
                 W.unsafe_store(o, acc)
     comptime if INV:
         # E = L~^-1 by rows (vectors up to the diagonal)
-        var Eb = Array[Float64, N * N](uninitialized=True)
+        var Eb = Array[Scalar[dt], N * N](uninitialized=True)
         var E = Eb.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
         comptime for i in range(N):
             comptime for v in range(i // V + 1):
-                var acc = SIMD[DType.float64, V](0.0)
+                var acc = SIMD[dt, V](0.0)
                 comptime if v == i // V:
                     acc[i % V] = 1.0
                 comptime for l in range(V * v, i):
@@ -319,16 +338,16 @@ def diag32[INV: Bool](T: Ptr, Lout: Ptr, Linv: Ptr, bw: Int = 32) -> Int:
 # block in the panels).  diag32 for bw > 24 (padded); potf2 and trilinv
 # otherwise and when diag32 fails (then potf2 gives LAPACK's info and the
 # partial factorization).
-def pk_diag(bw: Int, T: Ptr, D: Ptr, inv: Bool, Linv: Ptr, X: Ptr,
-            d: Ptr) -> Int:
+def pk_diag[dt: DType](bw: Int, T: PtrT[dt], D: PtrT[dt], inv: Bool,
+                      Linv: PtrT[dt], X: PtrT[dt], d: PtrT[dt]) -> Int:
     # for bw <= 24 potf2 is faster than the padded 32 x 32 kernel
     if bw > 24:
-        var info = diag32[True](T, D, Linv, bw) if inv else diag32[False](
-            T, D, Linv, bw
-        )
+        var info = diag32[True, dt](T, D, Linv, bw) if inv else diag32[
+            False, dt
+        ](T, D, Linv, bw)
         if info == 0:
             return 0
-    var info = potf2[0](bw, T, 1, 32)
+    var info = potf2[0, dt](bw, T, 1, 32)
     var t = 0
     while t < 1024:
         D.unsafe_store(t, T.unsafe_load[width=V](t))
@@ -353,22 +372,22 @@ def pk_diag(bw: Int, T: Ptr, D: Ptr, inv: Bool, Linv: Ptr, X: Ptr,
 # the explicit inverse of their diagonal block of L, computed by potrf_rec
 # (Linv: the inverses of the diagonal blocks of L, IB x IB each), so that
 # almost all operations are in gemm.
-def trsm_rlt[SME: Bool](
-    m: Int, n: Int, L: Ptr, incRowL: Int, incColL: Int, Linv: Ptr,
-    B: Ptr, incRowB: Int, incColB: Int, mut buf: Buffers,
+def trsm_rlt[SME: Bool, dt: DType](
+    m: Int, n: Int, L: PtrT[dt], incRowL: Int, incColL: Int, Linv: PtrT[dt],
+    B: PtrT[dt], incRowB: Int, incColB: Int, mut buf: Buffers[dt],
 ):
     if n > IB:
         var n1 = ceildiv(n // 2, IB) * IB  # a multiple of IB, n1 < n
         var B2 = B.unsafe_offset(n1 * incColB)
         var L22 = L.unsafe_offset(n1 * incRowL + n1 * incColL)
-        trsm_rlt[SME](m, n1, L, incRowL, incColL, Linv, B, incRowB,
-                           incColB, buf)
-        gemm[SME](
+        trsm_rlt[SME, dt](m, n1, L, incRowL, incColL, Linv, B, incRowB,
+                          incColB, buf)
+        gemm[SME, dt](
             m, n - n1, n1, -1.0, B, incRowB, incColB,
             L.unsafe_offset(n1 * incRowL), incColL, incRowL,
             1.0, B2, incRowB, incColB, buf.ws,
         )
-        trsm_rlt[SME](
+        trsm_rlt[SME, dt](
             m, n - n1, L22, incRowL, incColL, Linv.unsafe_offset(n1 * IB), B2,
             incRowB, incColB, buf,
         )
@@ -377,36 +396,37 @@ def trsm_rlt[SME: Bool](
     # B = B X^T in place, element (r, c) of X^T is X[r + c*IB].  This is safe
     # with the gemm of gemm.mojo: k = n <= KC, and each block of rows of B
     # (as the left operand) is packed before the same rows of C are written.
-    gemm[SME](m, n, n, 1.0, B, incRowB, incColB, X, 1, IB, 0.0, B, incRowB,
-              incColB, buf.ws)
+    gemm[SME, dt](m, n, n, 1.0, B, incRowB, incColB, X, 1, IB, 0.0, B,
+                  incRowB, incColB, buf.ws)
 
 
 # Lower triangle of C <- beta C + alpha A A^T: C is n x n, A is n x k.
 # Recursive: with C = [C11 0; C21 C22] and A = [A1; A2]: C11 and C22 by
 # syrk, C21 by gemm.  Blocks of at most SB rows are computed into a buffer
 # and only the lower triangle is added.
-def syrk_ln[SME: Bool](
-    n: Int, k: Int, alpha: Float64, A: Ptr, incRowA: Int, incColA: Int,
-    beta: Float64, C: Ptr, incRowC: Int, incColC: Int, mut buf: Buffers,
+def syrk_ln[SME: Bool, dt: DType](
+    n: Int, k: Int, alpha: Scalar[dt], A: PtrT[dt], incRowA: Int,
+    incColA: Int, beta: Scalar[dt], C: PtrT[dt], incRowC: Int, incColC: Int,
+    mut buf: Buffers[dt],
 ):
     if n > SB:
         var n1 = ceildiv(n // 2, SB) * SB  # a multiple of SB, n1 < n
         var A2 = A.unsafe_offset(n1 * incRowA)
-        syrk_ln[SME](n1, k, alpha, A, incRowA, incColA, beta, C, incRowC,
-                     incColC, buf)
-        gemm[SME](
+        syrk_ln[SME, dt](n1, k, alpha, A, incRowA, incColA, beta, C, incRowC,
+                         incColC, buf)
+        gemm[SME, dt](
             n - n1, n1, k, alpha, A2, incRowA, incColA, A, incColA, incRowA,
             beta, C.unsafe_offset(n1 * incRowC), incRowC, incColC, buf.ws,
         )
-        syrk_ln[SME](
+        syrk_ln[SME, dt](
             n - n1, k, alpha, A2, incRowA, incColA, beta,
             C.unsafe_offset(n1 * incRowC + n1 * incColC), incRowC, incColC,
             buf,
         )
         return
     var T = buf.tmp(n * n)
-    gemm[SME](n, n, k, alpha, A, incRowA, incColA, A, incColA, incRowA, 0.0,
-              T, 1, n, buf.ws)
+    gemm[SME, dt](n, n, k, alpha, A, incRowA, incColA, A, incColA, incRowA,
+                  0.0, T, 1, n, buf.ws)
     for j in range(n):
         for i in range(j, n):
             var c = C.unsafe_offset(i * incRowC + j * incColC)
@@ -419,11 +439,12 @@ def syrk_ln[SME: Bool](
 # block, factor the trailing block.  Returns 0 or the LAPACK info.  With
 # ACC = 0 the inverses of the IB x IB diagonal blocks are stored in Linv for
 # trsm_rlt.
-def potrf_rec[SME: Bool, ACC: Int = 0](
-    n: Int, A: Ptr, incRowA: Int, incColA: Int, Linv: Ptr, mut buf: Buffers
+def potrf_rec[SME: Bool, ACC: Int, dt: DType](
+    n: Int, A: PtrT[dt], incRowA: Int, incColA: Int, Linv: PtrT[dt],
+    mut buf: Buffers[dt],
 ) -> Int:
     if n <= IB:
-        var info = potf2[ACC](n, A, incRowA, incColA)
+        var info = potf2[ACC, dt](n, A, incRowA, incColA)
         comptime if ACC == 0:  # inverses for trsm_rlt
             if info == 0:
                 trilinv(n, A, incRowA, incColA, Linv, buf.ptr_d())
@@ -433,7 +454,7 @@ def potrf_rec[SME: Bool, ACC: Int = 0](
     # powers of two
     while 2 * n1 < n:
         n1 *= 2
-    var info = potrf_rec[SME, ACC](n1, A, incRowA, incColA, Linv, buf)
+    var info = potrf_rec[SME, ACC, dt](n1, A, incRowA, incColA, Linv, buf)
     if info != 0:
         return info
     var A21 = A.unsafe_offset(n1 * incRowA)
@@ -442,14 +463,14 @@ def potrf_rec[SME: Bool, ACC: Int = 0](
         acc_trsm(n - n1, n1, A, A21, incRowA, incColA)
         acc_syrk(n - n1, n1, A21, A22, incRowA, incColA)
     else:
-        trsm_rlt[SME](n - n1, n1, A, incRowA, incColA, Linv, A21,
-                           incRowA, incColA, buf)
-        syrk_ln[SME](
+        trsm_rlt[SME, dt](n - n1, n1, A, incRowA, incColA, Linv, A21,
+                          incRowA, incColA, buf)
+        syrk_ln[SME, dt](
             n - n1, n1, -1.0, A21, incRowA, incColA, 1.0, A22, incRowA,
             incColA, buf,
         )
-    info = potrf_rec[SME, ACC](n - n1, A22, incRowA, incColA,
-                               Linv.unsafe_offset(n1 * IB), buf)
+    info = potrf_rec[SME, ACC, dt](n - n1, A22, incRowA, incColA,
+                                   Linv.unsafe_offset(n1 * IB), buf)
     return 0 if info == 0 else info + n1
 
 
@@ -478,11 +499,11 @@ def increment(p: IPtr, i: Int):
 # The task graph of one factorization: the matrix, the tasks (kind, i, j, k)
 # and the shared counters.  Copies refer to the same data.
 @fieldwise_init
-struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
+struct TaskGraph[SME: Bool, ACC: Int, dt: DType](ImplicitlyCopyable):
     var n: Int
     var nb: Int
     var nt: Int
-    var A: Ptr
+    var A: PtrT[Self.dt]
     var incRowA: Int
     var incColA: Int
     var num_tasks: Int
@@ -490,16 +511,16 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
     var state: IPtr  # nt x nt counters
     var claimed: IPtr  # one flag per task
     var done: IPtr  # [number of tasks done, info]
-    var Linv: Ptr  # inverses of the IB x IB diagonal blocks, see linv()
+    var Linv: PtrT[Self.dt]  # inverses of the IB x IB diagonal blocks
 
     # pointer to tile (i, j) and its size
-    def tile(self, i: Int, j: Int) -> Ptr:
+    def tile(self, i: Int, j: Int) -> PtrT[Self.dt]:
         return self.A.unsafe_offset(
             i * self.nb * self.incRowA + j * self.nb * self.incColA
         )
 
     # inverses of the diagonal blocks of tile (k, k): IB x IB each
-    def linv(self, k: Int) -> Ptr:
+    def linv(self, k: Int) -> PtrT[Self.dt]:
         return self.Linv.unsafe_offset(k * ceildiv(self.nb, IB) * IB * IB)
 
     def size(self, i: Int) -> Int:
@@ -522,7 +543,7 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
         return (self.st(i, j) == k and self.st(i, k) == k + 1
                 and self.st(j, k) == k + 1)
 
-    def run(self, t: Int, mut buf: Buffers):
+    def run(self, t: Int, mut buf: Buffers[Self.dt]):
         var kind = Int(self.task[unsafe_offset=4 * t])
         var i = Int(self.task[unsafe_offset=4 * t + 1])
         var j = Int(self.task[unsafe_offset=4 * t + 2])
@@ -532,7 +553,7 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
         # after a failed POTRF the remaining tasks only count themselves
         if load(self.done, 1) == 0:
             if kind == POTRF:
-                var info = potrf_rec[Self.SME, Self.ACC](
+                var info = potrf_rec[Self.SME, Self.ACC, Self.dt](
                     self.size(k), self.tile(k, k), r, c, self.linv(k), buf
                 )
                 if info != 0:
@@ -546,7 +567,7 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
                     acc_trsm(self.size(i), self.size(k), self.tile(k, k),
                              self.tile(i, k), r, c)
                 else:
-                    trsm_rlt[Self.SME](
+                    trsm_rlt[Self.SME, Self.dt](
                         self.size(i), self.size(k), self.tile(k, k), r, c,
                         self.linv(k), self.tile(i, k), r, c, buf,
                     )
@@ -555,7 +576,7 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
                     acc_syrk(self.size(i), self.size(k), self.tile(i, k),
                              self.tile(i, i), r, c)
                 else:
-                    syrk_ln[Self.SME](
+                    syrk_ln[Self.SME, Self.dt](
                         self.size(i), self.size(k), -1.0, self.tile(i, k), r,
                         c, 1.0, self.tile(i, i), r, c, buf,
                     )
@@ -565,7 +586,7 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
                              self.tile(i, k), self.tile(j, k),
                              self.tile(i, j), r, c)
                 else:
-                    gemm[Self.SME](
+                    gemm[Self.SME, Self.dt](
                         self.size(i), self.size(j), self.size(k), -1.0,
                         self.tile(i, k), r, c, self.tile(j, k), c, r,
                         1.0, self.tile(i, j), r, c, buf.ws,
@@ -577,7 +598,7 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
     # claimed by another worker.  Tasks become ready in roughly the
     # sequential order, so the scan starts at the first unclaimed one.
     def work(self):
-        var buf = Buffers()
+        var buf = Buffers[Self.dt]()
         var first = 0
         while load(self.done, 0) < self.num_tasks:
             while first < self.num_tasks and load(self.claimed, first) != 0:
@@ -600,26 +621,26 @@ struct TaskGraph[SME: Bool, ACC: Int](ImplicitlyCopyable):
 
 
 # Buffers of potrf_pk, kept by the caller and reused.
-struct PotrfContext(Movable):
-    var buf: List[Float64]  # the panels of L
-    var T: List[Float64]  # the updated blocks of the current block column
-    var Linv: List[Float64]  # inverse of the diagonal block, column major
-    var X: List[Float64]  # the same, by rows (trilinv)
-    var d: List[Float64]
-    var T2: List[Float64]  # potrf_pk3: second T and Linv, the flags
-    var Linv2: List[Float64]
+struct PotrfContext[dt: DType = f64](Movable):
+    var buf: List[Scalar[Self.dt]]  # the panels of L
+    var T: List[Scalar[Self.dt]]  # the updated blocks of the block column
+    var Linv: List[Scalar[Self.dt]]  # inverse of the diagonal block
+    var X: List[Scalar[Self.dt]]  # the same, by rows (trilinv)
+    var d: List[Scalar[Self.dt]]
+    var T2: List[Scalar[Self.dt]]  # potrf_pk3: second T and Linv, flags
+    var Linv2: List[Scalar[Self.dt]]
     var flags: List[Int64]
     var ctl: Int  # potrf_pk3: control block of the worker thread (calloc)
     var thread: Int  # pthread_t of the worker thread, 0: not started
 
     def __init__(out self):
-        self.buf = List[Float64]()
-        self.T = List[Float64]()
-        self.Linv = List[Float64](length=1024, fill=0.0)
-        self.X = List[Float64](length=1024, fill=0.0)
-        self.d = List[Float64](length=32, fill=0.0)
-        self.T2 = List[Float64]()
-        self.Linv2 = List[Float64]()
+        self.buf = List[Scalar[Self.dt]]()
+        self.T = List[Scalar[Self.dt]]()
+        self.Linv = List[Scalar[Self.dt]](length=1024, fill=0.0)
+        self.X = List[Scalar[Self.dt]](length=1024, fill=0.0)
+        self.d = List[Scalar[Self.dt]](length=32, fill=0.0)
+        self.T2 = List[Scalar[Self.dt]]()
+        self.Linv2 = List[Scalar[Self.dt]]()
         self.flags = List[Int64](length=3, fill=0)
         self.ctl = 0
         self.thread = 0
@@ -649,22 +670,58 @@ struct PotrfContext(Movable):
 
     def reserve(mut self, np: Int):
         if len(self.buf) < pk_offset(np):
-            self.buf = List[Float64](length=pk_offset(np), fill=0.0)
-            self.T = List[Float64](length=1024 * np, fill=0.0)
+            self.buf = List[Scalar[Self.dt]](length=pk_offset(np), fill=0.0)
+            self.T = List[Scalar[Self.dt]](length=1024 * np, fill=0.0)
 
 
-def uptr(mut v: List[Float64]) -> Ptr:
+def uptr[dt: DType](mut v: List[Scalar[dt]]) -> PtrT[dt]:
     return v.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+
+
+# 4 x 4 transpose: rows src + k ldsrc (4 contiguous elements each) become
+# rows dst + k lddst
+@always_inline
+def tr4[dt: DType](src: PtrT[dt], ldsrc: Int, dst: PtrT[dt], lddst: Int):
+    var r0 = src.unsafe_load[width=4](0)
+    var r1 = src.unsafe_load[width=4](ldsrc)
+    var r2 = src.unsafe_load[width=4](2 * ldsrc)
+    var r3 = src.unsafe_load[width=4](3 * ldsrc)
+    var t = r0.interleave(r2).interleave(r1.interleave(r3))
+    dst.unsafe_store(0, t.slice[4, offset=0]())
+    dst.unsafe_store(lddst, t.slice[4, offset=4]())
+    dst.unsafe_store(2 * lddst, t.slice[4, offset=8]())
+    dst.unsafe_store(3 * lddst, t.slice[4, offset=12]())
+
+
+# potrf_pk, row major: copy the full off-diagonal 32 x 32 blocks (P, L),
+# L = L0 .. L1-1, between A and the buffer with 4 x 4 transposes
+@always_inline
+def pk_copy_tr[dt: DType, IN: Bool](P: Int, L0: Int, L1: Int, A: PtrT[dt],
+                                   incRowA: Int, buf: PtrT[dt]):
+    var base = buf.unsafe_offset(pk_offset(P))
+    for l in range(32 * L0, 32 * L1, 4):
+        for i in range(0, 32, 4):
+            var a = A.unsafe_offset((32 * P + i) * incRowA + l)
+            var b = base.unsafe_offset(l * 32 + i)
+            comptime if IN:
+                tr4(a, incRowA, b, 32)
+            else:
+                tr4(b, 32, a, incRowA)
 
 
 # potrf_pk: copy in the lower triangle of A (rows i0 .. i1-1 of each panel
 # column), zero elsewhere; block columns K0 .. K1-1 (default: all)
-def pk_copy_in(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
-               buf: Ptr, K0: Int = 0, K1: Int = -1):
+def pk_copy_in[dt: DType](n: Int, np: Int, A: PtrT[dt], incRowA: Int,
+                         incColA: Int, buf: PtrT[dt], K0: Int = 0,
+                         K1: Int = -1):
     var k1 = np if K1 < 0 else K1
     for P in range(K0, np):
         var base = buf.unsafe_offset(pk_offset(P))
-        for l in range(32 * K0, 32 * min(P + 1, k1)):
+        var l0 = 32 * K0
+        if incColA == 1 and n - 32 * P >= 32 and K0 < min(P, k1):
+            pk_copy_tr[dt, True](P, K0, min(P, k1), A, incRowA, buf)
+            l0 = 32 * min(P, k1)
+        for l in range(l0, 32 * min(P + 1, k1)):
             var col = base.unsafe_offset(l * 32)
             var i0 = max(l - 32 * P, 0)
             var i1 = min(n - 32 * P, 32) if l < n else 0
@@ -674,7 +731,7 @@ def pk_copy_in(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
                     col.unsafe_store(v * V, src.unsafe_load[width=V](v * V))
                 continue
             for i in range(0, 32, V):
-                col.unsafe_store(i, SIMD[DType.float64, V](0.0))
+                col.unsafe_store(i, SIMD[dt, V](0.0))
             if incRowA == 1:
                 var i = i0
                 while i + V <= i1:
@@ -690,12 +747,17 @@ def pk_copy_in(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
 
 # potrf_pk: copy out the lower triangle; block columns K0 .. K1-1 (default:
 # all)
-def pk_copy_out(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
-                buf: Ptr, K0: Int = 0, K1: Int = -1):
+def pk_copy_out[dt: DType](n: Int, np: Int, A: PtrT[dt], incRowA: Int,
+                          incColA: Int, buf: PtrT[dt], K0: Int = 0,
+                          K1: Int = -1):
     var k1 = np if K1 < 0 else K1
     for P in range(K0, np):
         var base = buf.unsafe_offset(pk_offset(P))
-        for l in range(32 * K0, min(32 * min(P + 1, k1), n)):
+        var l0 = 32 * K0
+        if incColA == 1 and n - 32 * P >= 32 and K0 < min(P, k1):
+            pk_copy_tr[dt, False](P, K0, min(P, k1), A, incRowA, buf)
+            l0 = 32 * min(P, k1)
+        for l in range(l0, min(32 * min(P + 1, k1), n)):
             var col = base.unsafe_offset(l * 32)
             var i0 = max(l - 32 * P, 0)
             var i1 = min(n - 32 * P, 32)
@@ -717,6 +779,27 @@ def pk_copy_out(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
                     dst[unsafe_offset=i * incRowA] = col[unsafe_offset=i]
 
 
+# The SME2 kernels of potrf_pk for double or float (ugemm_sme.mojo).
+@always_inline
+def pk_upd[dt: DType](buf: PtrT[dt], T: PtrT[dt], K: Int, np: Int,
+                      P0: Int = -1):
+    comptime if dt == f32:
+        pk_update32(rebind[PtrF](buf), rebind[PtrF](T), K, np, P0)
+    else:
+        pk_update(rebind[Ptr](buf), rebind[Ptr](T), K, np, P0)
+
+
+@always_inline
+def pk_slv[dt: DType](buf: PtrT[dt], T: PtrT[dt], Linv: PtrT[dt], K: Int,
+                      np: Int, P0: Int = -1):
+    comptime if dt == f32:
+        pk_solve32(rebind[PtrF](buf), rebind[PtrF](T), rebind[PtrF](Linv), K,
+                   np, P0)
+    else:
+        pk_solve(rebind[Ptr](buf), rebind[Ptr](T), rebind[Ptr](Linv), K, np,
+                 P0)
+
+
 # Cholesky of the lower triangle for small n (SME2 only): the lower triangle
 # is copied once into panels of 32 rows (zero padded, so that all tiles are
 # full; see pk_offset), then for each block column K (32 columns):
@@ -727,8 +810,8 @@ def pk_copy_out(n: Int, np: Int, A: Ptr, incRowA: Int, incColA: Int,
 # the diagonal block of what the SME unit wrote.
 # and L is copied back once.  Returns 0 or the LAPACK info.
 @no_inline
-def potrf_pk(n: Int, A: Ptr, incRowA: Int, incColA: Int,
-             mut pk: PotrfContext) -> Int:
+def potrf_pk[dt: DType](n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
+                        mut pk: PotrfContext[dt]) -> Int:
     if n <= 0:
         return 0
     var np = ceildiv(n, 32)
@@ -747,7 +830,7 @@ def potrf_pk(n: Int, A: Ptr, incRowA: Int, incColA: Int,
         var bw = min(32, n - 32 * K)
         # T(P) = updated block (P, K), P >= K
         if K > 0:
-            pk_update(buf, T, K, np)
+            pk_upd(buf, T, K, np)
             fpsr_set(fpsr)
         else:
             for P in range(np):  # block column 0: nothing to update
@@ -764,7 +847,7 @@ def potrf_pk(n: Int, A: Ptr, incRowA: Int, incColA: Int,
             info += 32 * K
             break
         if K + 1 < np:  # then bw = 32
-            pk_solve(buf, T, Linv, K, np)
+            pk_slv(buf, T, Linv, K, np)
             fpsr_set(fpsr)
 
     pk_copy_out(n, np, A, incRowA, incColA, buf)
@@ -781,25 +864,25 @@ def potrf_pk(n: Int, A: Ptr, incRowA: Int, incColA: Int,
 #     thread 1, K = 1, 2, ...:   wait; pk_diag of block K; signal
 # T and Linv alternate between two buffers (K even / odd).
 @fieldwise_init
-struct PkShared(ImplicitlyCopyable):
+struct PkShared[dt: DType](ImplicitlyCopyable):
     var n: Int
     var np: Int
-    var buf: Ptr
-    var T0: Ptr
-    var T1: Ptr
-    var L0: Ptr
-    var L1: Ptr
-    var X: Ptr
-    var d: Ptr
+    var buf: PtrT[Self.dt]
+    var T0: PtrT[Self.dt]
+    var T1: PtrT[Self.dt]
+    var L0: PtrT[Self.dt]
+    var L1: PtrT[Self.dt]
+    var X: PtrT[Self.dt]
+    var d: PtrT[Self.dt]
     var flags: IPtr  # [diagonal blocks ready, diagonal blocks done, info]
-    var A: Ptr
+    var A: PtrT[Self.dt]
     var incRowA: Int
     var incColA: Int
 
-    def T(self, K: Int) -> Ptr:
+    def T(self, K: Int) -> PtrT[Self.dt]:
         return self.T0 if K % 2 == 0 else self.T1
 
-    def Linv(self, K: Int) -> Ptr:
+    def Linv(self, K: Int) -> PtrT[Self.dt]:
         return self.L0 if K % 2 == 0 else self.L1
 
     # factorization and inverse of diagonal block K (T(K), pk_diag), L
@@ -830,11 +913,11 @@ struct PkShared(ImplicitlyCopyable):
                     return
             var Tc = self.T(K)
             var Tn = self.T(K + 1)
-            pk_solve(self.buf, Tc, self.Linv(K), K, K + 2, K + 1)
-            pk_update(self.buf, Tn, K + 1, K + 2, K + 1)
+            pk_slv(self.buf, Tc, self.Linv(K), K, K + 2, K + 1)
+            pk_upd(self.buf, Tn, K + 1, K + 2, K + 1)
             increment(self.flags, 0)  # diagonal block K+1 ready
-            pk_solve(self.buf, Tc, self.Linv(K), K, self.np, K + 2)
-            pk_update(self.buf, Tn, K + 1, self.np, K + 2)
+            pk_slv(self.buf, Tc, self.Linv(K), K, self.np, K + 2)
+            pk_upd(self.buf, Tn, K + 1, self.np, K + 2)
         fpsr_set(fpsr)
 
     # Besides the diagonal blocks the worker copies block column K+1 into
@@ -863,16 +946,31 @@ struct PkShared(ImplicitlyCopyable):
 
 # potrf_pk3: control block of the worker thread (Int64 entries): job
 # counter, jobs done, stop flag, then the fields of the PkShared of the
-# current job.
+# current job (the last one: 1 for float).
 comptime CTL_JOB = 0
 comptime CTL_DONE = 1
 comptime CTL_STOP = 2
 comptime CTL_SHARED = 3
-comptime CTL_SIZE = 16
+comptime CTL_SIZE = 20
 
 
-def ptr_at(c: IPtr, i: Int) -> Ptr:
-    return Ptr(unsafe_from_address=Int(c[unsafe_offset=i]))
+def ptr_at[dt: DType](c: IPtr, i: Int) -> PtrT[dt]:
+    return PtrT[dt](unsafe_from_address=Int(c[unsafe_offset=i]))
+
+
+# runs core_work of the PkShared of the job in the control block c
+def run_job[dt: DType](c: IPtr):
+    var b = CTL_SHARED
+    var g = PkShared[dt](
+        Int(c[unsafe_offset=b]), Int(c[unsafe_offset=b + 1]),
+        ptr_at[dt](c, b + 2), ptr_at[dt](c, b + 3), ptr_at[dt](c, b + 4),
+        ptr_at[dt](c, b + 5), ptr_at[dt](c, b + 6), ptr_at[dt](c, b + 7),
+        ptr_at[dt](c, b + 8),
+        IPtr(unsafe_from_address=Int(c[unsafe_offset=b + 9])),
+        ptr_at[dt](c, b + 10), Int(c[unsafe_offset=b + 11]),
+        Int(c[unsafe_offset=b + 12]),
+    )
+    g.core_work()
 
 
 # The worker thread of potrf_pk3: waits (spinning, later yielding) for a
@@ -887,17 +985,10 @@ def pk_thread_main(arg: Int) abi("C") -> Int:
     while load(c, CTL_STOP) == 0:
         var job = load(c, CTL_JOB)
         if job > load(c, CTL_DONE):
-            var b = CTL_SHARED
-            var g = PkShared(
-                Int(c[unsafe_offset=b]), Int(c[unsafe_offset=b + 1]),
-                ptr_at(c, b + 2), ptr_at(c, b + 3), ptr_at(c, b + 4),
-                ptr_at(c, b + 5), ptr_at(c, b + 6), ptr_at(c, b + 7),
-                ptr_at(c, b + 8),
-                IPtr(unsafe_from_address=Int(c[unsafe_offset=b + 9])),
-                ptr_at(c, b + 10), Int(c[unsafe_offset=b + 11]),
-                Int(c[unsafe_offset=b + 12]),
-            )
-            g.core_work()
+            if c[unsafe_offset=CTL_SHARED + 13] == 1:
+                run_job[f32](c)
+            else:
+                run_job[f64](c)
             increment(c, CTL_DONE)
             idle = 0
         else:
@@ -911,21 +1002,21 @@ def pk_thread_main(arg: Int) abi("C") -> Int:
 # core by the persistent worker thread of the PotrfContext (see PkShared,
 # pk_thread_main).
 @no_inline
-def potrf_pk3(n: Int, A: Ptr, incRowA: Int, incColA: Int,
-              mut pk: PotrfContext) -> Int:
+def potrf_pk3[dt: DType](n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
+                         mut pk: PotrfContext[dt]) -> Int:
     if n <= 0:
         return 0
     var np = ceildiv(n, 32)
     pk.reserve(np)
     if len(pk.T2) < 1024 * np:
-        pk.T2 = List[Float64](length=1024 * np, fill=0.0)
-        pk.Linv2 = List[Float64](length=1024, fill=0.0)
+        pk.T2 = List[Scalar[dt]](length=1024 * np, fill=0.0)
+        pk.Linv2 = List[Scalar[dt]](length=1024, fill=0.0)
     pk.start()
     var buf = uptr(pk.buf)
     pk_copy_in(n, np, A, incRowA, incColA, buf, 0, min(np, 2))
-    var g = PkShared(n, np, buf, uptr(pk.T), uptr(pk.T2), uptr(pk.Linv),
-                     uptr(pk.Linv2), uptr(pk.X), uptr(pk.d), iptr(pk.flags),
-                     A, incRowA, incColA)
+    var g = PkShared[dt](n, np, buf, uptr(pk.T), uptr(pk.T2), uptr(pk.Linv),
+                         uptr(pk.Linv2), uptr(pk.X), uptr(pk.d),
+                         iptr(pk.flags), A, incRowA, incColA)
     for i in range(3):
         pk.flags[i] = 0
     var T = g.T(0)
@@ -954,6 +1045,7 @@ def potrf_pk3(n: Int, A: Ptr, incRowA: Int, incColA: Int,
         c[unsafe_offset=b + 10] = Int64(Int(A))
         c[unsafe_offset=b + 11] = Int64(incRowA)
         c[unsafe_offset=b + 12] = Int64(incColA)
+        c[unsafe_offset=b + 13] = Int64(1 if dt == f32 else 0)
         var job = load(c, CTL_JOB) + 1
         increment(c, CTL_JOB)  # publishes the job (sequentially consistent)
         g.sme_work()
@@ -971,13 +1063,13 @@ def potrf_pk3(n: Int, A: Ptr, incRowA: Int, incColA: Int,
 
 # The tiled potrf with tasks (see potrf below): tiles of nb x nb, nthreads
 # threads.
-def potrf_tiles[SME: Bool, ACC: Int](
-    lower: Bool, n: Int, A: Ptr, incRowA: Int, incColA: Int, nb: Int,
+def potrf_tiles[SME: Bool, ACC: Int, dt: DType](
+    lower: Bool, n: Int, A: PtrT[dt], incRowA: Int, incColA: Int, nb: Int,
     nthreads: Int,
 ) -> Int:
     if not lower:
-        return potrf_tiles[SME, ACC](True, n, A, incColA, incRowA, nb,
-                                     nthreads)
+        return potrf_tiles[SME, ACC, dt](True, n, A, incColA, incRowA, nb,
+                                         nthreads)
     if n <= 0:
         return 0
     var nt = ceildiv(n, nb)
@@ -1008,11 +1100,11 @@ def potrf_tiles[SME: Bool, ACC: Int](
     # inverses of the diagonal blocks: IB x IB each, ceildiv(nb, IB) per
     # tile (fewer for the last one); written before they are read
     var tile_blocks = ceildiv(nb, IB)
-    var linv = List[Float64](
+    var linv = List[Scalar[dt]](
         unsafe_uninit_length=((nt - 1) * tile_blocks
                               + ceildiv(n - (nt - 1) * nb, IB)) * IB * IB
     )
-    var g = TaskGraph[SME, ACC](
+    var g = TaskGraph[SME, ACC, dt](
         n, nb, nt, A, incRowA, incColA, num_tasks, iptr(tasks), iptr(state),
         iptr(claimed), iptr(counters),
         linv.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
@@ -1054,18 +1146,18 @@ comptime ALG_PK3 = 2  # pack once with lookahead on two threads (potrf_pk3)
 # from n.  Otherwise: tiles of nb x nb on nthreads threads.  The context
 # holds the buffers and the worker thread of potrf_pk3; keep it to reuse
 # them.
-def potrf[SME: Bool, ACC: Int = 0](
-    lower: Bool, n: Int, A: Ptr, incRowA: Int, incColA: Int,
-    mut ctx: PotrfContext, nb: Int = 256, nthreads: Int = 0,
+def potrf[SME: Bool, ACC: Int = 0, dt: DType = f64](
+    lower: Bool, n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
+    mut ctx: PotrfContext[dt], nb: Int = 256, nthreads: Int = 0,
 ) -> Int:
     comptime if ACC == 1:
         if incRowA != 1 and incColA != 1:  # CBLAS: one stride must be 1
-            return potrf[SME, 0](lower, n, A, incRowA, incColA, ctx, nb,
-                                 nthreads)
-    if nthreads > 0:
-        return potrf_tiles[SME, ACC](lower, n, A, incRowA, incColA, nb,
+            return potrf[SME, 0, dt](lower, n, A, incRowA, incColA, ctx, nb,
                                      nthreads)
-    var c = potrf_select[SME, ACC](n)
+    if nthreads > 0:
+        return potrf_tiles[SME, ACC, dt](lower, n, A, incRowA, incColA, nb,
+                                         nthreads)
+    var c = potrf_select[SME, ACC, dt](n)
     comptime if SME and ACC == 0:
         if c[0] != ALG_TILES:
             # the lower triangle of the (transposed, if upper) view
@@ -1074,14 +1166,16 @@ def potrf[SME: Bool, ACC: Int = 0](
             if c[0] == ALG_PK:
                 return potrf_pk(n, A, r, cl, ctx)
             return potrf_pk3(n, A, r, cl, ctx)
-    return potrf_tiles[SME, ACC](lower, n, A, incRowA, incColA, c[2], c[1])
+    return potrf_tiles[SME, ACC, dt](lower, n, A, incRowA, incColA, c[2],
+                                     c[1])
 
 
 # The same with a temporary context (potrf_pk3 then starts its worker
 # thread on every call).
-def potrf[SME: Bool, ACC: Int = 0](
-    lower: Bool, n: Int, A: Ptr, incRowA: Int, incColA: Int,
+def potrf[SME: Bool, ACC: Int = 0, dt: DType = f64](
+    lower: Bool, n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
     nb: Int = 256, nthreads: Int = 0,
 ) -> Int:
-    var ctx = PotrfContext()
-    return potrf[SME, ACC](lower, n, A, incRowA, incColA, ctx, nb, nthreads)
+    var ctx = PotrfContext[dt]()
+    return potrf[SME, ACC, dt](lower, n, A, incRowA, incColA, ctx, nb,
+                               nthreads)

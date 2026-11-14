@@ -6,7 +6,8 @@ BLAS (Basic Linear Algebra Subprograms) and LAPACK (Linear Algebra
 PACKage) implementation in C++, to Mojo?  After a day it turned into a bit
 more.
 
-In short (Apple M5, double precision):
+In short (Apple M5, double precision; single precision gives the same
+picture):
 
 - [GEMM (general matrix-matrix multiply)](#1-experiments-with-porting-gemm)
   in Mojo is within a few percent of my C++ implementation ulmBLAS for
@@ -14,8 +15,8 @@ In short (Apple M5, double precision):
 - [A Cholesky
   factorization](#2-if-we-had-a-competitive-blas-could-we-provide-a-competitive-lapack)
   on top of it is faster than Apple Accelerate from about n = 200 on (with a
-  second core for the work around the SME unit, which Accelerate does not
-  use).  In place, for any storage order.  The one in numax is currently 8
+  second core for the work around the SME (Scalable Matrix Extension) unit,
+  which Accelerate does not use).  In place, for any storage order.  The one in numax is currently 8
   to 47 times slower, so this could go there.
 - [Linear algebra mapping](#3-the-real-thing-to-solve-linear-algebra-mapping):
   my compiler ulm.lam, built on MLIR (Multi-Level Intermediate
@@ -27,12 +28,12 @@ The details are in four parts:
 
 1. [Experiments with porting GEMM (general matrix-matrix
    multiply)](#1-experiments-with-porting-gemm)\
-   DGEMM (double precision GEMM) with NEON and SME2 (Scalable Matrix
-   Extension 2) micro kernels.
+   DGEMM (double precision GEMM) and SGEMM (single precision GEMM) with NEON
+   and SME2 (Scalable Matrix Extension 2) micro kernels.
 2. [If we had a competitive BLAS, could we provide a competitive
    LAPACK?](#2-if-we-had-a-competitive-blas-could-we-provide-a-competitive-lapack)\
-   The Cholesky factorization, on our BLAS and on the BLAS of Apple
-   Accelerate.
+   The Cholesky factorization in double and single precision, on our BLAS
+   and on the BLAS of Apple Accelerate.
 3. [The real thing to solve: linear algebra
    mapping](#3-the-real-thing-to-solve-linear-algebra-mapping)\
    This is why I got interested in MLIR (Multi-Level Intermediate
@@ -94,9 +95,13 @@ The idea is simple and explained in my GEMM tutorial
 
 The micro kernels are basically those of ulmBLAS:
 [NEON](https://github.com/michael-lehn/ulmBLAS/blob/master/ulmblas/level3/ukernel/neon/ugemm.tcc)
-(an 8 x 6 tile, here written in plain Mojo SIMD code) and
+(an 8 x 6 tile for double, 8 x 12 for float, here written in plain Mojo SIMD
+code) and
 [SME2 (Scalable Matrix Extension 2)](https://github.com/michael-lehn/ulmBLAS/blob/master/ulmblas/level3/ukernel/sme/ugemm.tcc)
-(a 32 x 16 tile, here ported to inline assembly).
+(a 32 x 16 tile for double, 32 x 32 for float, here ported to inline
+assembly).  For float, full panels that have to be transposed while packing
+go through the ZA array (the matrix register of the SME unit): rows in,
+columns out.
 
 What is special: as in BLIS, the
 matrices do not have to be stored column major.  Row major is fine, and so
@@ -112,7 +117,7 @@ Why GEMM is important:
   (triangular solve with multiple right-hand sides), ...) depends on the platform specific micro kernel.
 - The performance of LAPACK depends on the efficiency of the BLAS.
 
-### Benchmarks
+### Benchmarks with 64 bit floats (double precision)
 
 C = A*B with m = n = k = 50, 100, ..., 4000, C row major, for the four
 storage orders of A and B.  One thread on an Apple M5 (macOS 26.6),
@@ -513,12 +518,406 @@ I am currently optimizing ulmBLAS for smaller dimensions.
 
 </details>
 
+### Benchmarks with 32 bit floats (single precision)
+
+The same for SGEMM: the same sizes, storage orders and libraries, measured
+with `./bench --float`.  The float kernels of ulmBLAS have the same tile
+sizes as the ones here.
+
+For large matrices the picture is the same as for double: for n >= 500 Mojo
+reaches 88 to 103% of ulmBLAS with NEON and 86 to 110% with SME2.  Accelerate
+is a bit faster for float: for n >= 1000 Mojo with SME2 reaches on average
+88 to 99% of Accelerate, depending on the storage orders.  Small matrices are
+again the open part: 70 to 83% of ulmBLAS at n = 250, 55 to 78% at n = 100.
+With NEON, Mojo is on par with ulmBLAS also for small matrices.
+
+#### A row major, B row major
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results-float/A-row_B-row/gflops-dark.svg">
+  <img alt="Performance of SGEMM, A row major, B row major, C row major" src="results-float/A-row_B-row/gflops-light.svg">
+</picture>
+
+<details>
+<summary>Mojo: time and GFLOP/s</summary>
+
+| m = n = k | NEON: time (s) | NEON: GFLOP/s | SME2: time (s) | SME2: GFLOP/s |
+|---:|---:|---:|---:|---:|
+| 50 | 3.764e-06 | 66.4 | 2.295e-06 | 108.9 |
+| 100 | 2.251e-05 | 88.8 | 5.596e-06 | 357.4 |
+| 150 | 6.443e-05 | 104.8 | 1.107e-05 | 609.5 |
+| 200 | 1.446e-04 | 110.7 | 1.986e-05 | 805.6 |
+| 250 | 2.748e-04 | 113.7 | 3.239e-05 | 964.9 |
+| 300 | 4.681e-04 | 115.4 | 4.866e-05 | 1109.8 |
+| 350 | 7.391e-04 | 116.0 | 7.067e-05 | 1213.4 |
+| 400 | 1.066e-03 | 120.0 | 9.560e-05 | 1338.9 |
+| 450 | 1.565e-03 | 116.5 | 1.441e-04 | 1264.5 |
+| 500 | 2.048e-03 | 122.0 | 1.784e-04 | 1401.0 |
+| 550 | 2.835e-03 | 117.4 | 2.384e-04 | 1395.6 |
+| 600 | 3.512e-03 | 123.0 | 2.868e-04 | 1506.1 |
+| 650 | 4.781e-03 | 114.9 | 3.725e-04 | 1474.5 |
+| 700 | 5.602e-03 | 122.5 | 4.423e-04 | 1551.1 |
+| 750 | 7.250e-03 | 116.4 | 5.483e-04 | 1538.9 |
+| 800 | 8.161e-03 | 125.5 | 6.399e-04 | 1600.2 |
+| 850 | 1.046e-02 | 117.4 | 7.798e-04 | 1575.0 |
+| 900 | 1.160e-02 | 125.7 | 9.855e-04 | 1479.5 |
+| 950 | 1.421e-02 | 120.7 | 1.069e-03 | 1604.6 |
+| 1000 | 1.587e-02 | 126.0 | 1.309e-03 | 1528.0 |
+| 1050 | 1.893e-02 | 122.3 | 1.511e-03 | 1532.2 |
+| 1100 | 2.126e-02 | 125.2 | 1.840e-03 | 1447.1 |
+| 1150 | 2.483e-02 | 122.5 | 2.009e-03 | 1514.3 |
+| 1200 | 2.728e-02 | 126.7 | 2.379e-03 | 1452.7 |
+| 1250 | 3.395e-02 | 115.1 | 2.612e-03 | 1495.7 |
+| 1300 | 3.531e-02 | 124.4 | 2.924e-03 | 1502.9 |
+| 1350 | 4.100e-02 | 120.0 | 3.247e-03 | 1515.5 |
+| 1400 | 4.400e-02 | 124.7 | 3.559e-03 | 1542.0 |
+| 1450 | 5.090e-02 | 119.8 | 3.991e-03 | 1527.8 |
+| 1500 | 5.378e-02 | 125.5 | 4.385e-03 | 1539.3 |
+| 1550 | 5.963e-02 | 124.9 | 4.827e-03 | 1543.0 |
+| 1600 | 6.455e-02 | 126.9 | 5.419e-03 | 1511.6 |
+| 1650 | 7.155e-02 | 125.6 | 5.770e-03 | 1557.1 |
+| 1700 | 8.148e-02 | 120.6 | 6.664e-03 | 1474.5 |
+| 1750 | 8.430e-02 | 127.1 | 6.887e-03 | 1556.4 |
+| 1800 | 9.207e-02 | 126.7 | 7.972e-03 | 1463.1 |
+| 1850 | 1.059e-01 | 119.5 | 8.060e-03 | 1571.1 |
+| 1900 | 1.081e-01 | 126.9 | 9.468e-03 | 1448.8 |
+| 1950 | 1.172e-01 | 126.5 | 9.461e-03 | 1567.4 |
+| 2000 | 1.300e-01 | 123.0 | 1.038e-02 | 1541.9 |
+| 2050 | 1.366e-01 | 126.1 | 1.277e-02 | 1348.9 |
+| 2100 | 1.465e-01 | 126.5 | 1.319e-02 | 1403.8 |
+| 2150 | 1.574e-01 | 126.3 | 1.448e-02 | 1372.3 |
+| 2200 | 1.698e-01 | 125.4 | 1.500e-02 | 1419.9 |
+| 2250 | 1.856e-01 | 122.7 | 1.680e-02 | 1356.0 |
+| 2300 | 2.006e-01 | 121.3 | 1.698e-02 | 1432.9 |
+| 2350 | 2.099e-01 | 123.7 | 1.884e-02 | 1377.8 |
+| 2400 | 2.166e-01 | 127.7 | 1.824e-02 | 1515.8 |
+| 2450 | 2.307e-01 | 127.5 | 2.153e-02 | 1366.4 |
+| 2500 | 2.431e-01 | 128.5 | 2.276e-02 | 1373.0 |
+| 2550 | 2.592e-01 | 127.9 | 2.281e-02 | 1453.9 |
+| 2600 | 2.784e-01 | 126.3 | 2.470e-02 | 1423.3 |
+| 2650 | 2.921e-01 | 127.4 | 2.548e-02 | 1460.8 |
+| 2700 | 3.176e-01 | 123.9 | 2.628e-02 | 1497.7 |
+| 2750 | 3.401e-01 | 122.3 | 3.007e-02 | 1383.4 |
+| 2800 | 3.526e-01 | 124.5 | 2.845e-02 | 1543.1 |
+| 2850 | 3.745e-01 | 123.6 | 3.131e-02 | 1478.8 |
+| 2900 | 3.830e-01 | 127.3 | 3.438e-02 | 1418.8 |
+| 2950 | 3.998e-01 | 128.4 | 3.392e-02 | 1513.7 |
+| 3000 | 4.213e-01 | 128.2 | 3.537e-02 | 1526.9 |
+| 3050 | 4.544e-01 | 124.9 | 3.962e-02 | 1432.1 |
+| 3100 | 4.649e-01 | 128.2 | 4.082e-02 | 1459.6 |
+| 3150 | 4.899e-01 | 127.6 | 4.262e-02 | 1466.6 |
+| 3200 | 5.231e-01 | 125.3 | 4.312e-02 | 1519.8 |
+| 3250 | 5.394e-01 | 127.3 | 4.875e-02 | 1408.3 |
+| 3300 | 5.583e-01 | 128.7 | 4.813e-02 | 1493.3 |
+| 3350 | 5.860e-01 | 128.3 | 5.036e-02 | 1493.0 |
+| 3400 | 6.145e-01 | 127.9 | 5.307e-02 | 1481.2 |
+| 3450 | 6.478e-01 | 126.8 | 5.697e-02 | 1441.5 |
+| 3500 | 6.820e-01 | 125.7 | 5.658e-02 | 1515.7 |
+| 3550 | 7.052e-01 | 126.9 | 5.907e-02 | 1514.9 |
+| 3600 | 7.413e-01 | 125.9 | 6.030e-02 | 1547.6 |
+| 3650 | 7.630e-01 | 127.5 | 6.739e-02 | 1443.2 |
+| 3700 | 7.878e-01 | 128.6 | 7.150e-02 | 1416.8 |
+| 3750 | 8.297e-01 | 127.1 | 7.000e-02 | 1506.7 |
+| 3800 | 8.672e-01 | 126.5 | 7.428e-02 | 1477.4 |
+| 3850 | 8.879e-01 | 128.5 | 7.546e-02 | 1512.4 |
+| 3900 | 9.375e-01 | 126.6 | 7.745e-02 | 1531.8 |
+| 3950 | 9.825e-01 | 125.5 | 8.643e-02 | 1426.2 |
+| 4000 | 1.005e+00 | 127.4 | 8.402e-02 | 1523.4 |
+
+</details>
+
+#### A row major, B column major
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results-float/A-row_B-col/gflops-dark.svg">
+  <img alt="Performance of SGEMM, A row major, B column major, C row major" src="results-float/A-row_B-col/gflops-light.svg">
+</picture>
+
+<details>
+<summary>Mojo: time and GFLOP/s</summary>
+
+| m = n = k | NEON: time (s) | NEON: GFLOP/s | SME2: time (s) | SME2: GFLOP/s |
+|---:|---:|---:|---:|---:|
+| 50 | 4.494e-06 | 55.6 | 2.900e-06 | 86.2 |
+| 100 | 2.320e-05 | 86.2 | 4.536e-06 | 440.9 |
+| 150 | 6.912e-05 | 97.7 | 1.095e-05 | 616.4 |
+| 200 | 1.478e-04 | 108.3 | 1.739e-05 | 920.1 |
+| 250 | 2.840e-04 | 110.1 | 3.063e-05 | 1020.1 |
+| 300 | 4.801e-04 | 112.5 | 4.415e-05 | 1223.0 |
+| 350 | 7.505e-04 | 114.3 | 6.341e-05 | 1352.3 |
+| 400 | 1.128e-03 | 113.4 | 8.702e-05 | 1470.9 |
+| 450 | 1.657e-03 | 110.0 | 1.266e-04 | 1439.8 |
+| 500 | 2.285e-03 | 109.4 | 1.632e-04 | 1531.7 |
+| 550 | 2.758e-03 | 120.6 | 2.229e-04 | 1492.5 |
+| 600 | 3.558e-03 | 121.4 | 2.645e-04 | 1633.3 |
+| 650 | 4.538e-03 | 121.0 | 3.574e-04 | 1536.7 |
+| 700 | 5.590e-03 | 122.7 | 4.074e-04 | 1683.8 |
+| 750 | 6.818e-03 | 123.7 | 5.409e-04 | 1559.9 |
+| 800 | 8.228e-03 | 124.4 | 5.737e-04 | 1785.0 |
+| 850 | 1.002e-02 | 122.6 | 7.394e-04 | 1661.3 |
+| 900 | 1.153e-02 | 126.5 | 8.696e-04 | 1676.6 |
+| 950 | 1.393e-02 | 123.1 | 1.007e-03 | 1703.0 |
+| 1000 | 1.606e-02 | 124.5 | 1.208e-03 | 1655.5 |
+| 1050 | 1.880e-02 | 123.2 | 1.399e-03 | 1655.1 |
+| 1100 | 2.125e-02 | 125.3 | 1.667e-03 | 1597.1 |
+| 1150 | 2.435e-02 | 124.9 | 1.855e-03 | 1639.7 |
+| 1200 | 2.766e-02 | 124.9 | 2.128e-03 | 1624.3 |
+| 1250 | 3.134e-02 | 124.6 | 2.428e-03 | 1608.9 |
+| 1300 | 3.514e-02 | 125.0 | 2.788e-03 | 1576.1 |
+| 1350 | 3.909e-02 | 125.9 | 3.066e-03 | 1605.1 |
+| 1400 | 4.586e-02 | 119.7 | 3.437e-03 | 1596.7 |
+| 1450 | 4.829e-02 | 126.3 | 3.758e-03 | 1622.5 |
+| 1500 | 5.506e-02 | 122.6 | 4.198e-03 | 1607.8 |
+| 1550 | 5.861e-02 | 127.1 | 4.562e-03 | 1632.4 |
+| 1600 | 6.512e-02 | 125.8 | 4.997e-03 | 1639.5 |
+| 1650 | 7.513e-02 | 119.6 | 5.456e-03 | 1646.6 |
+| 1700 | 7.713e-02 | 127.4 | 6.091e-03 | 1613.2 |
+| 1750 | 8.412e-02 | 127.4 | 6.474e-03 | 1655.7 |
+| 1800 | 9.225e-02 | 126.4 | 7.177e-03 | 1625.3 |
+| 1850 | 1.002e-01 | 126.4 | 7.594e-03 | 1667.5 |
+| 1900 | 1.076e-01 | 127.4 | 8.322e-03 | 1648.4 |
+| 1950 | 1.161e-01 | 127.7 | 8.895e-03 | 1667.2 |
+| 2000 | 1.253e-01 | 127.7 | 9.668e-03 | 1654.9 |
+| 2050 | 1.364e-01 | 126.4 | 1.204e-02 | 1430.9 |
+| 2100 | 1.493e-01 | 124.1 | 1.200e-02 | 1543.3 |
+| 2150 | 1.641e-01 | 121.1 | 1.387e-02 | 1433.4 |
+| 2200 | 1.679e-01 | 126.8 | 1.351e-02 | 1576.1 |
+| 2250 | 1.803e-01 | 126.4 | 1.467e-02 | 1552.5 |
+| 2300 | 1.900e-01 | 128.1 | 1.560e-02 | 1560.2 |
+| 2350 | 2.064e-01 | 125.7 | 1.651e-02 | 1572.0 |
+| 2400 | 2.164e-01 | 127.8 | 1.791e-02 | 1544.0 |
+| 2450 | 2.397e-01 | 122.7 | 1.850e-02 | 1589.8 |
+| 2500 | 2.446e-01 | 127.7 | 1.997e-02 | 1564.7 |
+| 2550 | 2.620e-01 | 126.6 | 2.071e-02 | 1601.5 |
+| 2600 | 2.726e-01 | 129.0 | 2.194e-02 | 1602.2 |
+| 2650 | 2.891e-01 | 128.7 | 2.479e-02 | 1501.2 |
+| 2700 | 3.071e-01 | 128.2 | 2.462e-02 | 1599.0 |
+| 2750 | 3.257e-01 | 127.7 | 2.617e-02 | 1589.3 |
+| 2800 | 3.417e-01 | 128.5 | 2.865e-02 | 1532.3 |
+| 2850 | 3.616e-01 | 128.1 | 2.945e-02 | 1572.0 |
+| 2900 | 3.799e-01 | 128.4 | 3.125e-02 | 1561.1 |
+| 2950 | 4.046e-01 | 126.9 | 3.320e-02 | 1546.7 |
+| 3000 | 4.288e-01 | 125.9 | 3.361e-02 | 1606.6 |
+| 3050 | 4.399e-01 | 129.0 | 3.607e-02 | 1573.2 |
+| 3100 | 4.652e-01 | 128.1 | 3.935e-02 | 1514.2 |
+| 3150 | 4.947e-01 | 126.4 | 3.996e-02 | 1564.4 |
+| 3200 | 5.097e-01 | 128.6 | 4.120e-02 | 1590.8 |
+| 3250 | 5.382e-01 | 127.6 | 4.531e-02 | 1515.2 |
+| 3300 | 5.574e-01 | 128.9 | 4.543e-02 | 1582.1 |
+| 3350 | 5.881e-01 | 127.9 | 4.724e-02 | 1591.6 |
+| 3400 | 6.225e-01 | 126.3 | 4.931e-02 | 1594.0 |
+| 3450 | 6.390e-01 | 128.5 | 5.399e-02 | 1521.1 |
+| 3500 | 6.706e-01 | 127.9 | 5.338e-02 | 1606.5 |
+| 3550 | 7.091e-01 | 126.2 | 5.549e-02 | 1612.4 |
+| 3600 | 7.284e-01 | 128.1 | 5.733e-02 | 1627.6 |
+| 3650 | 7.539e-01 | 129.0 | 6.114e-02 | 1590.7 |
+| 3700 | 7.872e-01 | 128.7 | 6.405e-02 | 1581.7 |
+| 3750 | 8.356e-01 | 126.2 | 6.720e-02 | 1569.4 |
+| 3800 | 8.509e-01 | 129.0 | 6.654e-02 | 1649.2 |
+| 3850 | 9.078e-01 | 125.7 | 7.026e-02 | 1624.4 |
+| 3900 | 9.220e-01 | 128.7 | 7.255e-02 | 1635.3 |
+| 3950 | 9.702e-01 | 127.0 | 7.677e-02 | 1605.6 |
+| 4000 | 1.017e+00 | 125.9 | 7.988e-02 | 1602.5 |
+
+</details>
+
+#### A column major, B row major
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results-float/A-col_B-row/gflops-dark.svg">
+  <img alt="Performance of SGEMM, A column major, B row major, C row major" src="results-float/A-col_B-row/gflops-light.svg">
+</picture>
+
+<details>
+<summary>Mojo: time and GFLOP/s</summary>
+
+| m = n = k | NEON: time (s) | NEON: GFLOP/s | SME2: time (s) | SME2: GFLOP/s |
+|---:|---:|---:|---:|---:|
+| 50 | 3.417e-06 | 73.2 | 1.885e-06 | 132.6 |
+| 100 | 1.966e-05 | 101.7 | 5.839e-06 | 342.5 |
+| 150 | 6.020e-05 | 112.1 | 1.199e-05 | 562.9 |
+| 200 | 1.383e-04 | 115.7 | 2.357e-05 | 678.7 |
+| 250 | 2.584e-04 | 120.9 | 3.472e-05 | 900.1 |
+| 300 | 4.523e-04 | 119.4 | 5.264e-05 | 1025.9 |
+| 350 | 7.029e-04 | 122.0 | 7.204e-05 | 1190.4 |
+| 400 | 1.037e-03 | 123.4 | 1.043e-04 | 1227.3 |
+| 450 | 1.458e-03 | 125.0 | 1.508e-04 | 1208.2 |
+| 500 | 1.970e-03 | 126.9 | 1.937e-04 | 1290.7 |
+| 550 | 2.639e-03 | 126.1 | 2.559e-04 | 1300.5 |
+| 600 | 3.351e-03 | 128.9 | 3.033e-04 | 1424.3 |
+| 650 | 4.388e-03 | 125.2 | 3.953e-04 | 1389.5 |
+| 700 | 5.382e-03 | 127.5 | 4.669e-04 | 1469.2 |
+| 750 | 6.778e-03 | 124.5 | 5.802e-04 | 1454.4 |
+| 800 | 7.941e-03 | 129.0 | 6.415e-04 | 1596.3 |
+| 850 | 1.008e-02 | 121.9 | 8.193e-04 | 1499.2 |
+| 900 | 1.139e-02 | 128.0 | 9.645e-04 | 1511.7 |
+| 950 | 1.430e-02 | 119.9 | 1.117e-03 | 1535.6 |
+| 1000 | 1.570e-02 | 127.4 | 1.277e-03 | 1566.0 |
+| 1050 | 1.928e-02 | 120.1 | 1.592e-03 | 1454.2 |
+| 1100 | 2.100e-02 | 126.8 | 1.823e-03 | 1460.4 |
+| 1150 | 2.505e-02 | 121.4 | 2.124e-03 | 1432.1 |
+| 1200 | 2.708e-02 | 127.6 | 2.285e-03 | 1512.5 |
+| 1250 | 3.197e-02 | 122.2 | 2.802e-03 | 1394.0 |
+| 1300 | 3.417e-02 | 128.6 | 2.928e-03 | 1500.9 |
+| 1350 | 3.968e-02 | 124.0 | 3.511e-03 | 1401.4 |
+| 1400 | 4.255e-02 | 129.0 | 3.649e-03 | 1503.9 |
+| 1450 | 4.812e-02 | 126.7 | 4.403e-03 | 1385.0 |
+| 1500 | 5.266e-02 | 128.2 | 4.524e-03 | 1492.2 |
+| 1550 | 5.863e-02 | 127.0 | 5.364e-03 | 1388.5 |
+| 1600 | 6.605e-02 | 124.0 | 5.450e-03 | 1503.2 |
+| 1650 | 7.009e-02 | 128.2 | 6.443e-03 | 1394.5 |
+| 1700 | 7.650e-02 | 128.4 | 6.676e-03 | 1471.8 |
+| 1750 | 8.329e-02 | 128.7 | 7.396e-03 | 1449.3 |
+| 1800 | 8.987e-02 | 129.8 | 7.839e-03 | 1487.9 |
+| 1850 | 1.000e-01 | 126.6 | 8.479e-03 | 1493.4 |
+| 1900 | 1.073e-01 | 127.8 | 9.319e-03 | 1472.1 |
+| 1950 | 1.152e-01 | 128.7 | 9.862e-03 | 1503.7 |
+| 2000 | 1.255e-01 | 127.5 | 1.037e-02 | 1543.1 |
+| 2050 | 1.408e-01 | 122.4 | 1.327e-02 | 1298.7 |
+| 2100 | 1.441e-01 | 128.5 | 1.415e-02 | 1308.6 |
+| 2150 | 1.565e-01 | 127.0 | 1.505e-02 | 1320.8 |
+| 2200 | 1.661e-01 | 128.2 | 1.657e-02 | 1285.4 |
+| 2250 | 1.779e-01 | 128.0 | 1.641e-02 | 1388.3 |
+| 2300 | 1.908e-01 | 127.5 | 1.737e-02 | 1401.3 |
+| 2350 | 2.082e-01 | 124.7 | 1.894e-02 | 1370.3 |
+| 2400 | 2.138e-01 | 129.3 | 1.814e-02 | 1524.3 |
+| 2450 | 2.312e-01 | 127.2 | 2.245e-02 | 1310.2 |
+| 2500 | 2.414e-01 | 129.5 | 2.164e-02 | 1444.0 |
+| 2550 | 2.567e-01 | 129.2 | 2.272e-02 | 1459.7 |
+| 2600 | 2.744e-01 | 128.1 | 2.399e-02 | 1465.2 |
+| 2650 | 2.897e-01 | 128.5 | 2.515e-02 | 1480.1 |
+| 2700 | 3.091e-01 | 127.4 | 2.839e-02 | 1386.4 |
+| 2750 | 3.331e-01 | 124.9 | 2.820e-02 | 1475.2 |
+| 2800 | 3.494e-01 | 125.6 | 2.830e-02 | 1551.6 |
+| 2850 | 3.648e-01 | 126.9 | 3.401e-02 | 1361.5 |
+| 2900 | 3.786e-01 | 128.8 | 3.235e-02 | 1507.7 |
+| 2950 | 3.985e-01 | 128.8 | 3.417e-02 | 1502.4 |
+| 3000 | 4.151e-01 | 130.1 | 3.696e-02 | 1461.0 |
+| 3050 | 4.475e-01 | 126.8 | 3.806e-02 | 1490.8 |
+| 3100 | 4.666e-01 | 127.7 | 4.079e-02 | 1460.6 |
+| 3150 | 4.838e-01 | 129.2 | 4.353e-02 | 1436.0 |
+| 3200 | 5.172e-01 | 126.7 | 4.668e-02 | 1404.0 |
+| 3250 | 5.293e-01 | 129.7 | 4.799e-02 | 1430.6 |
+| 3300 | 5.552e-01 | 129.5 | 4.889e-02 | 1470.1 |
+| 3350 | 5.963e-01 | 126.1 | 5.129e-02 | 1466.1 |
+| 3400 | 6.056e-01 | 129.8 | 5.578e-02 | 1409.3 |
+| 3450 | 6.373e-01 | 128.9 | 5.865e-02 | 1400.4 |
+| 3500 | 6.633e-01 | 129.3 | 5.757e-02 | 1489.5 |
+| 3550 | 6.912e-01 | 129.4 | 5.991e-02 | 1493.6 |
+| 3600 | 7.168e-01 | 130.2 | 6.288e-02 | 1484.0 |
+| 3650 | 7.702e-01 | 126.3 | 6.941e-02 | 1401.3 |
+| 3700 | 7.854e-01 | 129.0 | 6.754e-02 | 1499.8 |
+| 3750 | 8.110e-01 | 130.1 | 7.095e-02 | 1486.5 |
+| 3800 | 8.599e-01 | 127.6 | 7.580e-02 | 1447.7 |
+| 3850 | 8.823e-01 | 129.4 | 7.633e-02 | 1495.3 |
+| 3900 | 9.346e-01 | 126.9 | 8.270e-02 | 1434.6 |
+| 3950 | 9.588e-01 | 128.6 | 8.633e-02 | 1427.8 |
+| 4000 | 9.914e-01 | 129.1 | 8.296e-02 | 1542.9 |
+
+</details>
+
+#### A column major, B column major
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results-float/A-col_B-col/gflops-dark.svg">
+  <img alt="Performance of SGEMM, A column major, B column major, C row major" src="results-float/A-col_B-col/gflops-light.svg">
+</picture>
+
+<details>
+<summary>Mojo: time and GFLOP/s</summary>
+
+| m = n = k | NEON: time (s) | NEON: GFLOP/s | SME2: time (s) | SME2: GFLOP/s |
+|---:|---:|---:|---:|---:|
+| 50 | 4.038e-06 | 61.9 | 2.730e-06 | 91.6 |
+| 100 | 2.195e-05 | 91.1 | 5.889e-06 | 339.6 |
+| 150 | 6.673e-05 | 101.2 | 1.136e-05 | 594.1 |
+| 200 | 1.397e-04 | 114.5 | 1.969e-05 | 812.7 |
+| 250 | 2.818e-04 | 110.9 | 3.274e-05 | 954.6 |
+| 300 | 4.524e-04 | 119.4 | 4.916e-05 | 1098.5 |
+| 350 | 7.516e-04 | 114.1 | 6.753e-05 | 1269.8 |
+| 400 | 1.054e-03 | 121.4 | 9.557e-05 | 1339.3 |
+| 450 | 1.515e-03 | 120.3 | 1.403e-04 | 1299.3 |
+| 500 | 2.045e-03 | 122.2 | 1.792e-04 | 1395.0 |
+| 550 | 2.669e-03 | 124.7 | 2.388e-04 | 1393.6 |
+| 600 | 3.443e-03 | 125.5 | 2.821e-04 | 1531.5 |
+| 650 | 4.458e-03 | 123.2 | 3.790e-04 | 1449.1 |
+| 700 | 5.551e-03 | 123.6 | 4.324e-04 | 1586.5 |
+| 750 | 6.712e-03 | 125.7 | 5.573e-04 | 1513.9 |
+| 800 | 8.470e-03 | 120.9 | 6.079e-04 | 1684.6 |
+| 850 | 9.843e-03 | 124.8 | 7.923e-04 | 1550.2 |
+| 900 | 1.231e-02 | 118.4 | 9.135e-04 | 1596.0 |
+| 950 | 1.359e-02 | 126.1 | 1.070e-03 | 1602.1 |
+| 1000 | 1.696e-02 | 117.9 | 1.233e-03 | 1622.3 |
+| 1050 | 1.841e-02 | 125.7 | 1.431e-03 | 1618.4 |
+| 1100 | 2.262e-02 | 117.7 | 1.667e-03 | 1597.0 |
+| 1150 | 2.419e-02 | 125.7 | 1.879e-03 | 1618.5 |
+| 1200 | 2.868e-02 | 120.5 | 2.159e-03 | 1600.9 |
+| 1250 | 3.091e-02 | 126.4 | 2.479e-03 | 1575.5 |
+| 1300 | 3.590e-02 | 122.4 | 2.763e-03 | 1590.2 |
+| 1350 | 3.878e-02 | 126.9 | 3.144e-03 | 1565.3 |
+| 1400 | 4.317e-02 | 127.1 | 3.505e-03 | 1565.9 |
+| 1450 | 4.784e-02 | 127.5 | 3.898e-03 | 1564.3 |
+| 1500 | 5.311e-02 | 127.1 | 4.302e-03 | 1569.0 |
+| 1550 | 6.123e-02 | 121.6 | 4.719e-03 | 1578.3 |
+| 1600 | 6.417e-02 | 127.7 | 5.096e-03 | 1607.6 |
+| 1650 | 7.077e-02 | 127.0 | 5.612e-03 | 1600.9 |
+| 1700 | 7.753e-02 | 126.7 | 6.237e-03 | 1575.3 |
+| 1750 | 8.321e-02 | 128.8 | 6.821e-03 | 1571.3 |
+| 1800 | 9.410e-02 | 124.0 | 7.340e-03 | 1589.0 |
+| 1850 | 1.003e-01 | 126.2 | 8.012e-03 | 1580.5 |
+| 1900 | 1.075e-01 | 127.6 | 8.570e-03 | 1600.7 |
+| 1950 | 1.220e-01 | 121.6 | 9.644e-03 | 1537.8 |
+| 2000 | 1.244e-01 | 128.6 | 1.001e-02 | 1598.7 |
+| 2050 | 1.353e-01 | 127.3 | 1.269e-02 | 1357.4 |
+| 2100 | 1.450e-01 | 127.7 | 1.279e-02 | 1448.0 |
+| 2150 | 1.584e-01 | 125.5 | 1.366e-02 | 1454.8 |
+| 2200 | 1.689e-01 | 126.1 | 1.435e-02 | 1484.1 |
+| 2250 | 1.787e-01 | 127.5 | 1.527e-02 | 1491.6 |
+| 2300 | 1.902e-01 | 127.9 | 1.719e-02 | 1415.5 |
+| 2350 | 2.024e-01 | 128.2 | 1.716e-02 | 1512.7 |
+| 2400 | 2.167e-01 | 127.6 | 1.830e-02 | 1510.7 |
+| 2450 | 2.363e-01 | 124.4 | 1.948e-02 | 1509.6 |
+| 2500 | 2.538e-01 | 123.1 | 2.030e-02 | 1539.7 |
+| 2550 | 2.608e-01 | 127.2 | 2.244e-02 | 1478.1 |
+| 2600 | 2.718e-01 | 129.3 | 2.234e-02 | 1573.6 |
+| 2650 | 2.924e-01 | 127.3 | 2.396e-02 | 1553.7 |
+| 2700 | 3.052e-01 | 129.0 | 2.484e-02 | 1585.0 |
+| 2750 | 3.229e-01 | 128.8 | 2.592e-02 | 1604.8 |
+| 2800 | 3.409e-01 | 128.8 | 2.823e-02 | 1555.4 |
+| 2850 | 3.583e-01 | 129.2 | 3.010e-02 | 1538.2 |
+| 2900 | 3.783e-01 | 128.9 | 3.099e-02 | 1573.8 |
+| 2950 | 4.013e-01 | 127.9 | 3.406e-02 | 1507.7 |
+| 3000 | 4.198e-01 | 128.6 | 3.388e-02 | 1594.0 |
+| 3050 | 4.385e-01 | 129.4 | 3.639e-02 | 1559.2 |
+| 3100 | 4.662e-01 | 127.8 | 4.017e-02 | 1483.3 |
+| 3150 | 4.893e-01 | 127.8 | 4.060e-02 | 1539.6 |
+| 3200 | 5.087e-01 | 128.8 | 4.171e-02 | 1571.4 |
+| 3250 | 5.397e-01 | 127.2 | 4.485e-02 | 1531.0 |
+| 3300 | 5.673e-01 | 126.7 | 4.742e-02 | 1515.7 |
+| 3350 | 5.856e-01 | 128.4 | 4.831e-02 | 1556.4 |
+| 3400 | 6.122e-01 | 128.4 | 5.051e-02 | 1556.2 |
+| 3450 | 6.397e-01 | 128.4 | 5.584e-02 | 1470.6 |
+| 3500 | 6.666e-01 | 128.6 | 5.739e-02 | 1494.2 |
+| 3550 | 6.949e-01 | 128.8 | 5.685e-02 | 1574.0 |
+| 3600 | 7.190e-01 | 129.8 | 5.827e-02 | 1601.4 |
+| 3650 | 7.665e-01 | 126.9 | 6.163e-02 | 1578.1 |
+| 3700 | 7.971e-01 | 127.1 | 6.369e-02 | 1590.6 |
+| 3750 | 8.229e-01 | 128.2 | 6.928e-02 | 1522.4 |
+| 3800 | 8.448e-01 | 129.9 | 6.890e-02 | 1592.7 |
+| 3850 | 9.049e-01 | 126.1 | 7.131e-02 | 1600.6 |
+| 3900 | 9.151e-01 | 129.6 | 7.347e-02 | 1614.8 |
+| 3950 | 9.627e-01 | 128.0 | 7.788e-02 | 1582.7 |
+| 4000 | 1.013e+00 | 126.3 | 7.982e-02 | 1603.6 |
+
+</details>
+
 ## 2. If we had a competitive BLAS, could we provide a competitive LAPACK?
 
 Short answer: yes.  [`potrf.mojo`](potrf.mojo) started as a simplified port
 of ulmBLAS's task-parallel potrf.  DPOTRF (double precision positive
 definite triangular factorization) computes A = L L^T or A = U^T U, in
-place.  As everything here it works with `incRow` and `incCol`: column
+place.  SPOTRF (single precision positive definite triangular
+factorization) does the same for float, with the same code.  As everything here it works with `incRow` and `incCol`: column
 major, row major and general strides, lower and upper.
 
 > **Edit (2026-11-14):** In the meantime I ported more of the experimental
@@ -546,7 +945,8 @@ Two BLAS backends, chosen at compile time:
   and SYRK (symmetric rank-k update) on top of it, level 1 and 2 in
   [`level12.mojo`](level12.mojo);
 - Apple Accelerate, but only its BLAS (`dgemm`, `dtrsm`, `dsyrk`, `ddot`,
-  `dgemv`, `dscal`).  Everything above BLAS is Mojo.
+  `dgemv`, `dscal`, and the `s` versions for float).  Everything above BLAS
+  is Mojo.
 
 Three algorithms:
 
@@ -576,7 +976,7 @@ Three algorithms:
   halved the time for a diagonal block compared with potf2 and a separate
   inverse.
 - Pack once with lookahead.  The same, but a second thread works on another
-  core while the SME (Scalable Matrix Extension) unit updates the rest: it
+  core while the SME unit updates the rest: it
   factors the next diagonal block, copies the next block column of A into
   the panels and copies finished block columns back.  So the copies, which
   do not get faster on one core, are hidden behind the SME work.  Lock-free,
@@ -587,13 +987,16 @@ Which algorithm, how many threads and which tile size is chosen by
 Tuned Linear Algebra Software) it is generated by a tuning step on the
 machine ([`tune-potrf.sh`](tune-potrf.sh)).  On the M5: pack once with
 lookahead for n = 100 ... 2500, pack once at 3000, tiles on 3 or 4 threads
-above ([`tune-potrf/summary.md`](tune-potrf/summary.md)).
+above.  For float it chooses pack once with lookahead from n = 100 on
+([`tune-potrf/summary.md`](tune-potrf/summary.md)).
 
 In a final version the select functions would be part of the package.
 They are benchmarked once for every supported platform.  At run time the
 implementation checks on which machine it runs and uses the matching
 select function.  Tuning on the machine itself stays optional, to get the
 last bit out of it.
+
+### Benchmarks with 64 bit floats (double precision)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results-potrf/col/gflops-dark.svg">
@@ -605,14 +1008,14 @@ GFLOP/s (n^3/3 operations), lower, column major:
 | n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate dpotrf | numax (float64, row major) |
 |---:|---:|---:|---:|---:|
 | 100 | 33 | 27 | 38 | 1 |
-| 250 | 167 | 89 | 133 | 4 |
-| 500 | 308 | 209 | 253 | 12 |
-| 750 | 375 | 277 | 308 | 15 |
-| 1000 | 399 | 354 | 380 | 18 |
-| 1500 | 431 | 364 | 391 | 22 |
-| 2000 | 426 | 399 | 375 | 24 |
-| 3000 | 328 | 358 | 317 | 27 |
-| 4000 | 379 | 386 | 290 | 31 |
+| 250 | 167 | 90 | 133 | 4 |
+| 500 | 305 | 209 | 252 | 12 |
+| 750 | 365 | 276 | 308 | 15 |
+| 1000 | 394 | 356 | 375 | 18 |
+| 1500 | 401 | 362 | 386 | 22 |
+| 2000 | 402 | 396 | 381 | 24 |
+| 3000 | 295 | 359 | 315 | 27 |
+| 4000 | 369 | 384 | 292 | 31 |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results-potrf/row/gflops-dark.svg">
@@ -623,33 +1026,33 @@ GFLOP/s, lower, row major:
 
 | n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate dpotrf | numax (float64, row major) |
 |---:|---:|---:|---:|---:|
-| 100 | 30 | 25 | 31 | 1 |
-| 250 | 136 | 81 | 104 | 4 |
-| 500 | 285 | 196 | 193 | 12 |
-| 750 | 354 | 243 | 234 | 15 |
-| 1000 | 368 | 332 | 295 | 18 |
-| 1500 | 425 | 347 | 298 | 22 |
-| 2000 | 403 | 358 | 307 | 24 |
-| 3000 | 325 | 353 | 302 | 27 |
-| 4000 | 344 | 359 | 295 | 31 |
+| 100 | 33 | 25 | 31 | 1 |
+| 250 | 163 | 81 | 103 | 4 |
+| 500 | 302 | 195 | 192 | 12 |
+| 750 | 351 | 247 | 235 | 15 |
+| 1000 | 393 | 325 | 294 | 18 |
+| 1500 | 426 | 329 | 298 | 22 |
+| 2000 | 397 | 361 | 303 | 24 |
+| 3000 | 340 | 334 | 302 | 27 |
+| 4000 | 328 | 357 | 291 | 31 |
 
 What this shows:
 
 - With the Mojo BLAS the Mojo potrf is faster than Accelerate's own `dpotrf`
-  from about n = 200 on.  For n >= 250, column major, it is faster for 75 of
-  76 sizes, on average by 16%; row major for 73 of 76 sizes, on average by
-  27%.
+  from about n = 200 on.  For n >= 250, column major, it is faster for 73 of
+  76 sizes, on average by 14%; row major for 75 of 76 sizes, on average by
+  31%.
 - With one thread (pack once without lookahead, numbers from the tuning
   step) the Mojo potrf is behind Accelerate up to n = 2000 and 5 to 18%
   faster for n = 2500 ... 4000.  The second thread adds no arithmetic, both
   threads share the one SME unit.  It removes waiting: diagonal blocks and
   copies run while the SME unit computes.
 - With only the BLAS of Accelerate, column major, it reaches on average 97%
-  of Accelerate's `dpotrf` for n = 1000 ... 2000 and is on average 15%
-  faster for n > 2000.  Row major it is on average 12% faster for n >= 1000
-  (faster for 60 of 61 of these sizes).
+  of Accelerate's `dpotrf` for n = 1000 ... 2000 and is on average 16%
+  faster for n > 2000.  Row major it is on average 13% faster for n >= 1000
+  (faster for all 61 of these sizes).
 - numax is 8 to 47 times slower (n >= 250).
-- Small matrices (n around 100) are still open: about 85% of Accelerate
+- Small matrices (n around 100) are still open: about 86% of Accelerate
   column major, on par row major.
 
 Notes:
@@ -673,6 +1076,67 @@ Notes:
   `matmul` of MAX (Modular's kernel library), which for float64 uses
   MAX's own NEON kernel, not SME.
 - All results are checked (400 random elements of L L^T against A).
+
+### Benchmarks with 32 bit floats (single precision)
+
+The same for SPOTRF, with its own tuning step (`sh tune-potrf.sh --float`)
+and Accelerate's `spotrf` (also on one thread) for comparison.  numax is
+missing here: its float32 version needs Apple's Metal toolchain to build,
+which I have not installed.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results-potrf-float/col/gflops-dark.svg">
+  <img alt="Performance of SPOTRF, column major, on an Apple M5" src="results-potrf-float/col/gflops-light.svg">
+</picture>
+
+GFLOP/s, lower, column major:
+
+| n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate spotrf |
+|---:|---:|---:|---:|
+| 100 | 53 | 43 | 65 |
+| 250 | 281 | 178 | 271 |
+| 500 | 725 | 429 | 617 |
+| 750 | 1074 | 684 | 856 |
+| 1000 | 1299 | 945 | 1061 |
+| 1500 | 1579 | 1288 | 1291 |
+| 2000 | 1601 | 1457 | 1464 |
+| 3000 | 1676 | 1501 | 1493 |
+| 4000 | 1483 | 1466 | 1373 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results-potrf-float/row/gflops-dark.svg">
+  <img alt="Performance of SPOTRF, row major, on an Apple M5" src="results-potrf-float/row/gflops-light.svg">
+</picture>
+
+GFLOP/s, lower, row major:
+
+| n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate spotrf |
+|---:|---:|---:|---:|
+| 100 | 51 | 35 | 53 |
+| 250 | 251 | 142 | 206 |
+| 500 | 708 | 349 | 452 |
+| 750 | 1071 | 574 | 595 |
+| 1000 | 1310 | 830 | 761 |
+| 1500 | 1577 | 1118 | 901 |
+| 2000 | 1660 | 1258 | 1041 |
+| 3000 | 1652 | 1332 | 1003 |
+| 4000 | 1359 | 1365 | 1009 |
+
+What this shows:
+
+- With the Mojo BLAS the Mojo potrf is faster than Accelerate's `spotrf`
+  from n = 200 on, for every size measured.  For n >= 250 on average by 16%
+  column major and by 65% row major.  Row major, Accelerate's `spotrf` is
+  much slower than column major; ours is the same for both orders, because
+  the panels are copied with 4 x 4 transposes.
+- Here the second thread is essential.  With one thread (pack once without
+  lookahead) the Mojo potrf reaches only 77 to 90% of Accelerate.  For float
+  the SME unit computes twice as fast, so everything around it (diagonal
+  blocks, copies) counts twice as much.
+- With only the BLAS of Accelerate it reaches on average 97% of `spotrf`
+  for n >= 1000 column major, and is on average 26% faster row major.
+- Small matrices are open here too: at n = 100, 81% of Accelerate column
+  major, 96% row major.
 
 ## 3. The real thing to solve: linear algebra mapping
 
@@ -803,8 +1267,8 @@ What I missed in this experiment (Mojo 1.2):
 - [`test.mojo`](test.mojo): tests for column major, row major and general
   strides;
 - [`run-benchmarks.sh`](run-benchmarks.sh): all benchmarks above,
-  [`plot.py`](plot.py): the plots and tables, [`results/`](results): the
-  raw results.
+  [`plot.py`](plot.py): the plots and tables, [`results/`](results) and
+  [`results-float/`](results-float): the raw results.
 - [`potrf.mojo`](potrf.mojo): the Cholesky factorization (tiles and
   tasks, pack once, lookahead), [`level12.mojo`](level12.mojo): BLAS level
   1 and 2;
@@ -813,8 +1277,8 @@ What I missed in this experiment (Mojo 1.2):
 - [`bench_potrf.mojo`](bench_potrf.mojo), [`test_potrf.mojo`](test_potrf.mojo):
   benchmark and tests of potrf;
 - [`run-potrf-benchmarks.sh`](run-potrf-benchmarks.sh),
-  [`plot_potrf.py`](plot_potrf.py), [`results-potrf/`](results-potrf):
-  the potrf benchmarks, [`bench_numax_cholesky.mojo`](bench_numax_cholesky.mojo):
+  [`plot_potrf.py`](plot_potrf.py), [`results-potrf/`](results-potrf),
+  [`results-potrf-float/`](results-potrf-float): the potrf benchmarks, [`bench_numax_cholesky.mojo`](bench_numax_cholesky.mojo):
   numax.
 
 ```sh
@@ -823,11 +1287,14 @@ pixi run build
 ./bench sme                                    # C = A*B, all row major
 ./bench neon --A=col --B=col --C=col 500 1000  # column major, two sizes
 ./bench sme --alpha=2 --beta=1                 # C = C + 2*A*B
+./bench sme --float                            # SGEMM
 pixi run test-potrf
 pixi run build-potrf
 ./bench-potrf sme --threads=auto 1000 2000     # DPOTRF, chosen by potrf_select
 ./bench-potrf accelerate-blas --threads=auto   # with the BLAS of Accelerate
+./bench-potrf sme --float --threads=auto       # SPOTRF
 sh tune-potrf.sh                               # tuning step (half an hour)
+sh tune-potrf.sh --float                       # the same for float
 ```
 
 `./bench PATH` measures `cblas_dgemm` of the shared library `PATH` with

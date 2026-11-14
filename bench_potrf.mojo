@@ -1,14 +1,16 @@
-# Benchmark of DPOTRF: Cholesky factorization A = L L^T (or U^T U).
+# Benchmark of DPOTRF or SPOTRF (--float): Cholesky factorization
+# A = L L^T (or U^T U).
 #
-#   ./bench-potrf IMPL [--uplo=L|U] [--order=row|col] [--threads=T]
-#                      [--nb=NB] [n ...]
+#   ./bench-potrf IMPL [--float] [--uplo=L|U] [--order=row|col]
+#                      [--threads=T] [--nb=NB] [n ...]
 #
 #   IMPL   neon        Mojo potrf, Mojo BLAS with NEON micro kernel
 #          sme         Mojo potrf, Mojo BLAS with SME2 micro kernel
 #          accelerate-blas
 #                      Mojo potrf, BLAS of Accelerate
-#          PATH        dpotrf of the shared library PATH (LAPACK interface,
-#                      column major; Accelerate: dpotrf$NEWLAPACK)
+#          PATH        dpotrf (spotrf) of the shared library PATH (LAPACK
+#                      interface, column major; Accelerate:
+#                      dpotrf$NEWLAPACK)
 #   --threads, --nb    threads and tile size of the Mojo potrf;
 #                      --threads=auto: both from potrf_select (tuning)
 #   defaults: lower, column major, 1 thread, nb = 256,
@@ -25,20 +27,21 @@ from std.random import random_float64, random_ui64, seed
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from gemm import Ptr, Workspace, gemm
+from gemm import PtrT, Workspace, gemm
 from potrf import PotrfContext, potrf, potrf_pk, potrf_pk3
 
 comptime NEWLAPACK = "/System/Library/Frameworks/Accelerate.framework/Accelerate"
 
 
-def raw(mut A: List[Float64]) -> Ptr:
+def raw[dt: DType](mut A: List[Scalar[dt]]) -> PtrT[dt]:
     return A.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
 
 
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: bench-potrf neon|sme|accelerate-blas|PATH [--uplo=L|U]",
+        print("usage: bench-potrf neon|sme|accelerate-blas|PATH [--float]",
+              "[--uplo=L|U]",
               "[--order=row|col] [--threads=T|auto] [--nb=NB] [n ...]")
         return
     var impl = String(args[1])
@@ -49,9 +52,12 @@ def main() raises:
     var pkmode = 0  # --pk: pack once, left-looking (small n, SME2);
     # --pk3: the same with lookahead on two threads
     var sizes = List[Int]()
+    var single = False
     for i in range(2, len(args)):
         var a = String(args[i])
-        if a == "--uplo=L" or a == "--uplo=U":
+        if a == "--float":
+            single = True
+        elif a == "--uplo=L" or a == "--uplo=U":
             lower = a == "--uplo=L"
         elif a == "--order=row" or a == "--order=col":
             row = a == "--order=row"
@@ -76,18 +82,31 @@ def main() raises:
         UInt32(0x21), Int32(0)
     )
 
+    if single:
+        run[DType.float32](impl, lower, row, nthreads, nb, pkmode, sizes)
+    else:
+        run[DType.float64](impl, lower, row, nthreads, nb, pkmode, sizes)
+
+
+def run[dt: DType](
+    impl: String, lower: Bool, row: Bool, nthreads: Int, nb: Int, pkmode: Int,
+    sizes: List[Int],
+) raises:
+    comptime single = dt == DType.float32
     var kind = 0 if impl == "neon" else (1 if impl == "sme" else 2)
     var acc = 0
     if impl == "accelerate-blas":
         kind = 1
         acc = 1
     var lib = OwnedDLHandle(impl if kind == 2 else String(NEWLAPACK))
-    var symbol = String("dpotrf$NEWLAPACK") if impl == NEWLAPACK else String(
-        "dpotrf_"
-    )
+    var p = String("s") if single else String("d")
+    var symbol = p + (String("potrf$NEWLAPACK") if impl == NEWLAPACK else String(
+        "potrf_"
+    ))
     var dpotrf = lib.get_function[NoneType](symbol)
 
-    print(String("# DPOTRF, ", "lower" if lower else "upper", ", ",
+    print(String("# SPOTRF, " if single else "# DPOTRF, ",
+                 "lower" if lower else "upper", ", ",
                  "row major" if row else "col major"))
     if kind < 2:
         var blas = String("Accelerate") if acc == 1 else String(
@@ -102,16 +121,16 @@ def main() raises:
     print("# n seconds GFLOP/s check")
 
     seed(1)
-    var ws = Workspace()
-    var pkb = PotrfContext()
+    var ws = Workspace[dt]()
+    var pkb = PotrfContext[dt]()
     for n in sizes:
         # A0 = M M^T / n + I (column major; symmetric, so also row major)
-        var M = List[Float64](length=n * n, fill=0.0)
+        var M = List[Scalar[dt]](length=n * n, fill=0.0)
         for i in range(n * n):
-            M[i] = random_float64(-1.0, 1.0)
-        var A0 = List[Float64](length=n * n, fill=0.0)
-        gemm[True](n, n, n, 1.0 / Float64(n), raw(M), 1, n, raw(M), n, 1,
-                   0.0, raw(A0), 1, n, ws)
+            M[i] = Scalar[dt](random_float64(-1.0, 1.0))
+        var A0 = List[Scalar[dt]](length=n * n, fill=0.0)
+        gemm[True, dt](n, n, n, Scalar[dt](1.0 / Float64(n)), raw(M), 1, n,
+                       raw(M), n, 1, 0.0, raw(A0), 1, n, ws)
         for i in range(n):
             A0[i * n + i] += 1.0
         var A = A0.copy()
@@ -137,14 +156,14 @@ def main() raises:
                     else:
                         info = potrf_pk3(n, raw(A), r, c, pkb)
                 elif kind == 0:
-                    info = potrf[False](lower, n, raw(A), incRow, incCol, pkb,
-                                        nb, nthreads)
+                    info = potrf[False, 0, dt](lower, n, raw(A), incRow,
+                                               incCol, pkb, nb, nthreads)
                 elif kind == 1 and acc == 0:
-                    info = potrf[True](lower, n, raw(A), incRow, incCol, pkb,
-                                       nb, nthreads)
+                    info = potrf[True, 0, dt](lower, n, raw(A), incRow,
+                                              incCol, pkb, nb, nthreads)
                 elif kind == 1:
-                    info = potrf[True, 1](lower, n, raw(A), incRow, incCol,
-                                          pkb, nb, nthreads)
+                    info = potrf[True, 1, dt](lower, n, raw(A), incRow,
+                                              incCol, pkb, nb, nthreads)
                 else:
                     # LAPACK is column major: row major lower = col major
                     # upper
@@ -172,15 +191,17 @@ def main() raises:
 
 
 # 400 random elements (i, j), i >= j, of L L^T against A0.
-def check(n: Int, lower: Bool, A: List[Float64], incRow: Int, incCol: Int,
-          A0: List[Float64]) -> Bool:
-    comptime eps = 2.220446049250313e-16
+def check[dt: DType](n: Int, lower: Bool, A: List[Scalar[dt]], incRow: Int,
+                     incCol: Int, A0: List[Scalar[dt]]) -> Bool:
+    comptime eps = 2.220446049250313e-16 if dt == DType.float64 else (
+        1.1920928955078125e-07
+    )
     # element (i, j) of L at A[i*rl + j*cl]
     var rl = incRow if lower else incCol
     var cl = incCol if lower else incRow
     var amax = 0.0
     for x in A0:
-        amax = max(amax, abs(x))
+        amax = max(amax, abs(Float64(x)))
     for _ in range(400):
         var i = Int(random_ui64(0, UInt64(n - 1)))
         var j = Int(random_ui64(0, UInt64(n - 1)))
@@ -188,7 +209,7 @@ def check(n: Int, lower: Bool, A: List[Float64], incRow: Int, incCol: Int,
             i, j = j, i
         var s = 0.0
         for l in range(j + 1):
-            s += A[i * rl + l * cl] * A[j * rl + l * cl]
-        if abs(s - A0[i * n + j]) > 8.0 * Float64(n) * eps * amax:
+            s += Float64(A[i * rl + l * cl]) * Float64(A[j * rl + l * cl])
+        if abs(s - Float64(A0[i * n + j])) > 8.0 * Float64(n) * eps * amax:
             return False
     return True

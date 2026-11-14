@@ -348,6 +348,254 @@ def mgemm_sme(
 
 
 # ---------------------------------------------------------------------------
+# SME2 micro kernel for float, MR x NR = 32 x 32, after the float kernel of
+# ulmBLAS (ulmblas/level3/ukernel/sme/sgemm.tcc).  The 32 x 32 tile of C is
+# held transposed in the four 16 x 16 tiles ZA0.S ... ZA3.S: tile ZA(i + 2j)
+# holds rows 16i ... 16i+15 of columns 16j ... 16j+15, a horizontal slice r
+# of ZA(i + 2j) is part of column 16j + r of C.  In the ZA array the slice r
+# of ZA(t) is row 4r + t, so column c < 16 of the tile is ZA rows 4c, 4c+1
+# and column c + 16 is ZA rows 4c+2, 4c+3.  Per k: one 2-vector load of the
+# column of the panel of A, one of the row of the panel of B, four FMOPA.
+# ---------------------------------------------------------------------------
+
+comptime PtrF = MutPointer[Float32, MutUntrackedOrigin]
+
+# Operands: $0 kc (>= 1), $1 A panel, $2 B panel, $3 C, $4 ldC in bytes,
+# $5 16*ldC - 128 in bytes, $6 load C into ZA first (1) or start from zero.
+comptime KERNEL32_S = """
+    ptrue p0.s
+    ptrue pn8.s
+    zero {za}
+    mov x9, $1
+    mov x10, $2
+    mov x11, $0
+    cbz $6, 2f
+    mov w12, #0
+    mov x13, $3
+1:
+    add x14, x13, $5
+    ldr za[w12, 0], [x13]
+    ldr za[w12, 1], [x13, #1, mul vl]
+    ldr za[w12, 2], [x14, #2, mul vl]
+    ldr za[w12, 3], [x14, #3, mul vl]
+    add x13, x13, $4
+    add w12, w12, #4
+    cmp w12, #64
+    b.lt 1b
+2:
+    ld1w {z0.s-z1.s}, pn8/z, [x9]
+    ld1w {z2.s-z3.s}, pn8/z, [x10]
+    fmopa za0.s, p0/m, p0/m, z2.s, z0.s
+    fmopa za1.s, p0/m, p0/m, z2.s, z1.s
+    fmopa za2.s, p0/m, p0/m, z3.s, z0.s
+    fmopa za3.s, p0/m, p0/m, z3.s, z1.s
+    add x9, x9, #128
+    add x10, x10, #128
+    subs x11, x11, #1
+    b.ne 2b
+    mov w12, #0
+    mov x13, $3
+3:
+    add x14, x13, $5
+    str za[w12, 0], [x13]
+    str za[w12, 1], [x13, #1, mul vl]
+    str za[w12, 2], [x14, #2, mul vl]
+    str za[w12, 3], [x14, #3, mul vl]
+    add x13, x13, $4
+    add w12, w12, #4
+    cmp w12, #64
+    b.lt 3b
+"""
+
+# Partial tiles (mr <= 32, nr <= 32, incRowC = 1), with predicates.
+# Operands: $0 kc, $1 A, $2 B, $3 C, $4 ldC in bytes, $5 mr, $6 nr, $7 load.
+comptime KERNEL32_P = """
+    ptrue p0.s
+    ptrue pn8.s
+    mov x15, #16
+    whilelt p1.s, xzr, $5
+    whilelt p2.s, x15, $5
+    zero {za}
+    mov x9, $1
+    mov x10, $2
+    mov x11, $0
+    cbz $7, 4f
+    mov x12, #0
+    mov x13, $3
+1:
+    cmp x12, $6
+    b.ge 4f
+    cmp x12, #16
+    b.ge 2f
+    ld1w {za0h.s[w12, 0]}, p1/z, [x13]
+    ld1w {za1h.s[w12, 0]}, p2/z, [x13, x15, lsl #2]
+    b 3f
+2:
+    sub w14, w12, #16
+    ld1w {za2h.s[w14, 0]}, p1/z, [x13]
+    ld1w {za3h.s[w14, 0]}, p2/z, [x13, x15, lsl #2]
+3:
+    add x13, x13, $4
+    add x12, x12, #1
+    b 1b
+4:
+    ld1w {z0.s-z1.s}, pn8/z, [x9]
+    ld1w {z2.s-z3.s}, pn8/z, [x10]
+    fmopa za0.s, p0/m, p0/m, z2.s, z0.s
+    fmopa za1.s, p0/m, p0/m, z2.s, z1.s
+    fmopa za2.s, p0/m, p0/m, z3.s, z0.s
+    fmopa za3.s, p0/m, p0/m, z3.s, z1.s
+    add x9, x9, #128
+    add x10, x10, #128
+    subs x11, x11, #1
+    b.ne 4b
+    mov x12, #0
+    mov x13, $3
+5:
+    cmp x12, $6
+    b.ge 8f
+    cmp x12, #16
+    b.ge 6f
+    st1w {za0h.s[w12, 0]}, p1, [x13]
+    st1w {za1h.s[w12, 0]}, p2, [x13, x15, lsl #2]
+    b 7f
+6:
+    sub w14, w12, #16
+    st1w {za2h.s[w14, 0]}, p1, [x13]
+    st1w {za3h.s[w14, 0]}, p2, [x13, x15, lsl #2]
+7:
+    add x13, x13, $4
+    add x12, x12, #1
+    b 5b
+8:
+"""
+
+
+@always_inline
+def kernel32_s(kc: Int, A: PtrF, B: PtrF, C: PtrF, ldC: Int, load_c: Bool):
+    inlined_assembly[
+        KERNEL32_S, NoneType, constraints="r,r,r,r,r,r,r," + CLOBBERS
+    ](kc, A, B, C, ldC * 4, ldC * 64 - 128, Int(load_c))
+
+
+@always_inline
+def kernel32_partial_s(kc: Int, A: PtrF, B: PtrF, C: PtrF, ldC: Int, mr: Int,
+                       nr: Int, load_c: Bool):
+    inlined_assembly[
+        KERNEL32_P, NoneType, constraints="r,r,r,r,r,r,r,r," + CLOBBERS
+    ](kc, A, B, C, ldC * 4, mr, nr, Int(load_c))
+
+
+comptime MR_SME32 = 32
+comptime NR_SME32 = 32
+
+
+# Macro kernel for float in streaming mode, as mgemm_sme.
+@__llvm_metadata(`llvm.arm_streaming`)
+@no_inline
+def mgemm_sme32(
+    mc: Int, nc: Int, kc: Int, A_: PtrF, B_: PtrF, beta: Float32, C: PtrF,
+    incRowC: Int, incColC: Int,
+):
+    var T = Array[Float32, MR_SME32 * NR_SME32](uninitialized=True)
+    var T_ = T.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+    var direct_ok = incRowC == 1 and (beta == 0.0 or beta == 1.0)
+    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
+    comptime pf = PrefetchOptions().for_write().medium_locality()
+    var jr = 0
+    while jr < nc:
+        var nr = min(NR_SME32, nc - jr)
+        var ir = 0
+        while ir < mc:
+            var mr = min(MR_SME32, mc - ir)
+            var Ap = A_.unsafe_offset(ir * kc)
+            var Bp = B_.unsafe_offset(jr * kc)
+            var Cp = C.unsafe_offset(ir * incRowC + jr * incColC)
+            if direct_ok and mr == MR_SME32 and nr == NR_SME32:
+                comptime if PF32:
+                    comptime for c in range(NR_SME32):
+                        var Cc = Cp.unsafe_offset(c * incColC)
+                        prefetch[pf](Cc.unsafe_offset(32))
+                        prefetch[pf](Cc.unsafe_offset(48))
+                kernel32_s(kc, Ap, Bp, Cp, incColC, beta == 1.0)
+            elif direct_ok:
+                kernel32_partial_s(kc, Ap, Bp, Cp, incColC, mr, nr,
+                                   beta == 1.0)
+            else:
+                kernel32_s(kc, Ap, Bp, T_, MR_SME32, False)
+                for j in range(nr):
+                    for i in range(mr):
+                        var cij = Cp.unsafe_offset(i * incRowC + j * incColC)
+                        var v = T_[unsafe_offset=i + j * MR_SME32]
+                        if beta != 0.0:
+                            v += beta * cij[]
+                        cij[] = v
+            ir += MR_SME32
+        jr += NR_SME32
+    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
+
+
+comptime PF32 = True  # prefetch the tile of C below (as for double)
+
+# Packing of a full float panel (32 rows of A with unit column stride, or
+# 32 columns of B with unit row stride) as in ulmBLAS
+# (ulmblas/level3/ukernel/sme/spack.tcc): ZA as transpose buffer.  Per 16
+# values of k the 32 rows of X (row c: k floats at X + c*incX) are loaded
+# into the horizontal slices of ZA0.S (rows 0 .. 15) and ZA1.S (16 .. 31),
+# the vertical slices are the 32 elements per k.  Enters and leaves
+# streaming mode itself.
+# Operands: $0 k (>= 1), $1 X, $2 incX in bytes, $3 buffer.
+comptime PACK32_T = """
+    smstart
+    ptrue p0.s
+    zero {za}
+    mov x9, $1
+    mov x10, $3
+    mov x11, #0
+1:
+    cmp x11, $0
+    b.ge 9f
+    sub x12, $0, x11
+    whilelt p1.s, xzr, x12
+    mov x16, #16
+    cmp x12, #16
+    csel x16, x12, x16, lt
+    mov x14, x9
+    add x15, x9, $2, lsl #4
+    mov w13, #0
+2:
+    ld1w {za0h.s[w13, 0]}, p1/z, [x14]
+    ld1w {za1h.s[w13, 0]}, p1/z, [x15]
+    add x14, x14, $2
+    add x15, x15, $2
+    add w13, w13, #1
+    cmp w13, #16
+    b.lt 2b
+    mov w13, #0
+3:
+    add x17, x10, #64
+    st1w {za0v.s[w13, 0]}, p0, [x10]
+    st1w {za1v.s[w13, 0]}, p0, [x17]
+    add x10, x10, #128
+    add w13, w13, #1
+    cmp x13, x16
+    b.lt 3b
+    add x9, x9, #64
+    add x11, x11, #16
+    b 1b
+9:
+    smstop
+"""
+
+
+@always_inline
+def pack32_transpose(k: Int, X: PtrF, incX: Int, buffer: PtrF):
+    inlined_assembly[
+        PACK32_T, NoneType, constraints="r,r,r,r," + CLOBBERS
+    ](k, X, incX * 4, buffer)
+
+
+# ---------------------------------------------------------------------------
 # Kernels of potrf_pk (potrf.mojo): all operands in panels of 32 rows,
 # column by column (32 doubles per column), the C tile 32 x 16 with leading
 # dimension 32.  For streaming functions with ZA.
@@ -510,4 +758,128 @@ def pk_solve(buf: Ptr, T: Ptr, Linv: Ptr, K: Int, np: Int, P0: Int = -1):
         var Tp = T.unsafe_offset((P - K) * 1024)
         kernel_pk_slv(32, Tp, Linv, C)
         kernel_pk_slv(32, Tp, Linv.unsafe_offset(16), C.unsafe_offset(512))
+    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
+
+
+# ---------------------------------------------------------------------------
+# Kernels of potrf_pk for float: panels of 32 rows, 32 floats per column, a
+# 32 x 32 block of C (1024 floats, leading dimension 32) in the four tiles
+# ZA0.S ... ZA3.S as in the float GEMM kernel: one call per block.
+# ---------------------------------------------------------------------------
+
+# $0 kc (>= 1), $1 A, $2 B (32 rows of a panel), $3 C in, $4 C out:
+# C out = C in - A B^T (FMOPS)
+comptime KERNEL32_PK_UPD = """
+    ptrue p0.s
+    ptrue pn8.s
+    mov x9, $1
+    mov x10, $2
+    mov x11, $0
+    mov w12, #0
+    mov x13, $3
+1:
+    add x14, x13, #1920
+    ldr za[w12, 0], [x13]
+    ldr za[w12, 1], [x13, #1, mul vl]
+    ldr za[w12, 2], [x14, #2, mul vl]
+    ldr za[w12, 3], [x14, #3, mul vl]
+    add x13, x13, #128
+    add w12, w12, #4
+    cmp w12, #64
+    b.lt 1b
+2:
+    ld1w {z0.s-z1.s}, pn8/z, [x9]
+    ld1w {z2.s-z3.s}, pn8/z, [x10]
+    fmops za0.s, p0/m, p0/m, z2.s, z0.s
+    fmops za1.s, p0/m, p0/m, z2.s, z1.s
+    fmops za2.s, p0/m, p0/m, z3.s, z0.s
+    fmops za3.s, p0/m, p0/m, z3.s, z1.s
+    add x9, x9, #128
+    add x10, x10, #128
+    subs x11, x11, #1
+    b.ne 2b
+    mov w12, #0
+    mov x13, $4
+3:
+    add x14, x13, #1920
+    str za[w12, 0], [x13]
+    str za[w12, 1], [x13, #1, mul vl]
+    str za[w12, 2], [x14, #2, mul vl]
+    str za[w12, 3], [x14, #3, mul vl]
+    add x13, x13, #128
+    add w12, w12, #4
+    cmp w12, #64
+    b.lt 3b
+"""
+
+# $0 kc (>= 1), $1 A, $2 B (32 rows of a panel), $3 C: C = A B^T
+comptime KERNEL32_PK_SLV = """
+    ptrue p0.s
+    ptrue pn8.s
+    mov x9, $1
+    mov x10, $2
+    mov x11, $0
+    zero {za}
+2:
+    ld1w {z0.s-z1.s}, pn8/z, [x9]
+    ld1w {z2.s-z3.s}, pn8/z, [x10]
+    fmopa za0.s, p0/m, p0/m, z2.s, z0.s
+    fmopa za1.s, p0/m, p0/m, z2.s, z1.s
+    fmopa za2.s, p0/m, p0/m, z3.s, z0.s
+    fmopa za3.s, p0/m, p0/m, z3.s, z1.s
+    add x9, x9, #128
+    add x10, x10, #128
+    subs x11, x11, #1
+    b.ne 2b
+    mov w12, #0
+    mov x13, $3
+3:
+    add x14, x13, #1920
+    str za[w12, 0], [x13]
+    str za[w12, 1], [x13, #1, mul vl]
+    str za[w12, 2], [x14, #2, mul vl]
+    str za[w12, 3], [x14, #3, mul vl]
+    add x13, x13, #128
+    add w12, w12, #4
+    cmp w12, #64
+    b.lt 3b
+"""
+
+
+@always_inline
+def kernel32_pk_upd(kc: Int, A: PtrF, B: PtrF, Cin: PtrF, Cout: PtrF):
+    inlined_assembly[
+        KERNEL32_PK_UPD, NoneType, constraints="r,r,r,r,r," + CLOBBERS
+    ](kc, A, B, Cin, Cout)
+
+
+@always_inline
+def kernel32_pk_slv(kc: Int, A: PtrF, B: PtrF, C: PtrF):
+    inlined_assembly[
+        KERNEL32_PK_SLV, NoneType, constraints="r,r,r,r," + CLOBBERS
+    ](kc, A, B, C)
+
+
+# pk_update and pk_solve for float (see there)
+@__llvm_metadata(`llvm.arm_streaming`)
+@no_inline
+def pk_update32(buf: PtrF, T: PtrF, K: Int, np: Int, P0: Int = -1):
+    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
+    var kc = 32 * K
+    var Bk = buf.unsafe_offset(pk_offset(K))
+    for P in range(K if P0 < 0 else P0, np):
+        var Ap = buf.unsafe_offset(pk_offset(P))
+        kernel32_pk_upd(kc, Ap, Bk, Ap.unsafe_offset(K * 1024),
+                        T.unsafe_offset((P - K) * 1024))
+    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
+
+
+@__llvm_metadata(`llvm.arm_streaming`)
+@no_inline
+def pk_solve32(buf: PtrF, T: PtrF, Linv: PtrF, K: Int, np: Int,
+               P0: Int = -1):
+    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
+    for P in range(K + 1 if P0 < 0 else P0, np):
+        kernel32_pk_slv(32, T.unsafe_offset((P - K) * 1024), Linv,
+                        buf.unsafe_offset(pk_offset(P) + K * 1024))
     inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()

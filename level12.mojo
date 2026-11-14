@@ -4,17 +4,17 @@
 # multiple data) paths, all other strides plain loops.  Used by the
 # unblocked kernels of potrf.
 
-from gemm import Ptr
+from gemm import PtrT
 
-comptime V = 8  # SIMD width (doubles)
-comptime f64 = DType.float64
+comptime V = 8  # SIMD width (elements)
 
 
 # x^T y
-def dot(n: Int, x: Ptr, incX: Int, y: Ptr, incY: Int) -> Float64:
+def dot[dt: DType](n: Int, x: PtrT[dt], incX: Int, y: PtrT[dt],
+                   incY: Int) -> Scalar[dt]:
     if incX == 1 and incY == 1:
-        var s0 = SIMD[f64, V](0.0)
-        var s1 = SIMD[f64, V](0.0)
+        var s0 = SIMD[dt, V](0.0)
+        var s1 = SIMD[dt, V](0.0)
         var i = 0
         while i + 2 * V <= n:
             s0 += x.unsafe_load[width=V](i) * y.unsafe_load[width=V](i)
@@ -27,14 +27,14 @@ def dot(n: Int, x: Ptr, incX: Int, y: Ptr, incY: Int) -> Float64:
             s += x[unsafe_offset=i] * y[unsafe_offset=i]
             i += 1
         return s
-    var s = 0.0
+    var s = Scalar[dt](0.0)
     for i in range(n):
         s += x[unsafe_offset=i * incX] * y[unsafe_offset=i * incY]
     return s
 
 
 # x <- alpha x
-def scal(n: Int, alpha: Float64, x: Ptr, incX: Int):
+def scal[dt: DType](n: Int, alpha: Scalar[dt], x: PtrT[dt], incX: Int):
     if incX == 1:
         var i = 0
         while i + V <= n:
@@ -49,9 +49,9 @@ def scal(n: Int, alpha: Float64, x: Ptr, incX: Int):
 
 
 # y <- y + alpha A x, A is m x n
-def gemv(
-    m: Int, n: Int, alpha: Float64, A: Ptr, incRowA: Int, incColA: Int,
-    x: Ptr, incX: Int, y: Ptr, incY: Int,
+def gemv[dt: DType](
+    m: Int, n: Int, alpha: Scalar[dt], A: PtrT[dt], incRowA: Int,
+    incColA: Int, x: PtrT[dt], incX: Int, y: PtrT[dt], incY: Int,
 ):
     if m <= 0 or n <= 0:
         return

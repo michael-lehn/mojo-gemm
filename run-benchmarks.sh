@@ -6,6 +6,7 @@
 #  results/A-<order>_B-<order>/<implementation>.txt.
 #
 #      ULMBLAS=<prefix of 'make install-shared' of ulmBLAS> sh run-benchmarks.sh
+#      ... sh run-benchmarks.sh --float [n ...]   (SGEMM, in results-float/)
 #
 #  ulmBLAS: git clone https://github.com/michael-lehn/ulmBLAS
 #           cd ulmBLAS && make install-shared PREFIX=<prefix>
@@ -14,14 +15,21 @@
 set -e
 cd "$(dirname "$0")"
 pixi run mojo build -O3 -I . bench.mojo -o bench
+R=results
+F=""
+if [ "$1" = "--float" ]; then
+    R=results-float
+    F="--float"
+    shift
+fi
 
 ACCELERATE=/System/Library/Frameworks/Accelerate.framework/Accelerate
 
 for A in row col; do
     for B in row col; do
-        D=results/A-${A}_B-${B}
+        D=$R/A-${A}_B-${B}
         mkdir -p "$D"
-        opt="--A=$A --B=$B"
+        opt="$F --A=$A --B=$B"
         echo "A $A major, B $B major"
         ./bench neon $opt "$@" > "$D/mojo-neon.txt"
         ./bench sme $opt "$@" > "$D/mojo-sme2.txt"

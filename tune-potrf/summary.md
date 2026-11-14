@@ -1,6 +1,54 @@
 Fastest configuration per n; a configuration with fewer threads is taken if it is within 3% of the fastest.
 
-### sme
+### float, sme
+
+| n | algorithm | threads | nb | GFLOP/s |
+|---:|---|---:|---:|---:|
+| 50 | pk | 1 |  | 17 |
+| 100 | pk3 | 2 |  | 53 |
+| 150 | pk3 | 2 |  | 120 |
+| 200 | pk3 | 2 |  | 199 |
+| 250 | pk3 | 2 |  | 288 |
+| 300 | pk3 | 2 |  | 361 |
+| 400 | pk3 | 2 |  | 552 |
+| 500 | pk3 | 2 |  | 720 |
+| 650 | pk3 | 2 |  | 928 |
+| 800 | pk3 | 2 |  | 1192 |
+| 1000 | pk3 | 2 |  | 1287 |
+| 1250 | pk3 | 2 |  | 1418 |
+| 1500 | pk3 | 2 |  | 1590 |
+| 1750 | pk3 | 2 |  | 1653 |
+| 2000 | pk3 | 2 |  | 1631 |
+| 2500 | pk3 | 2 |  | 1714 |
+| 3000 | pk3 | 2 |  | 1731 |
+| 3500 | pk3 | 2 |  | 1673 |
+| 4000 | pk3 | 2 |  | 1419 |
+
+### float, accelerate-blas
+
+| n | algorithm | threads | nb | GFLOP/s |
+|---:|---|---:|---:|---:|
+| 50 | tiles | 1 | 4096 | 13 |
+| 100 | tiles | 1 | 4096 | 44 |
+| 150 | tiles | 1 | 4096 | 76 |
+| 200 | tiles | 1 | 256 | 125 |
+| 250 | tiles | 1 | 256 | 182 |
+| 300 | tiles | 1 | 512 | 221 |
+| 400 | tiles | 1 | 512 | 325 |
+| 500 | tiles | 1 | 512 | 426 |
+| 650 | tiles | 3 | 128 | 558 |
+| 800 | tiles | 2 | 256 | 788 |
+| 1000 | tiles | 2 | 256 | 947 |
+| 1250 | tiles | 3 | 256 | 1113 |
+| 1500 | tiles | 3 | 256 | 1293 |
+| 1750 | tiles | 3 | 256 | 1319 |
+| 2000 | tiles | 3 | 256 | 1470 |
+| 2500 | tiles | 3 | 256 | 1434 |
+| 3000 | tiles | 4 | 384 | 1498 |
+| 3500 | tiles | 4 | 512 | 1451 |
+| 4000 | tiles | 4 | 512 | 1488 |
+
+### double, sme
 
 | n | algorithm | threads | nb | GFLOP/s |
 |---:|---|---:|---:|---:|
@@ -24,7 +72,7 @@ Fastest configuration per n; a configuration with fewer threads is taken if it i
 | 3500 | tiles | 3 | 256 | 352 |
 | 4000 | tiles | 4 | 256 | 376 |
 
-### accelerate-blas
+### double, accelerate-blas
 
 | n | algorithm | threads | nb | GFLOP/s |
 |---:|---|---:|---:|---:|

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Plots (GFLOP/s, light and dark SVG) and Markdown tables of the DPOTRF
-results in results-potrf/<order>/ (see run-potrf-benchmarks.sh)."""
+results in results-potrf/<order>/ (see run-potrf-benchmarks.sh); with
+--float of the SPOTRF results in results-potrf-float/<order>/."""
 
 import pathlib
+import sys
 
 import matplotlib
 
 matplotlib.use("svg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-RESULTS = pathlib.Path(__file__).resolve().parent / "results-potrf"
+SINGLE = "--float" in sys.argv[1:]
+RESULTS = pathlib.Path(__file__).resolve().parent / (
+    "results-potrf-float" if SINGLE else "results-potrf")
+P = "s" if SINGLE else "d"
 ORDERS = {"col": "column major", "row": "row major"}
 
 # file -> (label, colour light, colour dark, line style)
@@ -17,7 +22,7 @@ SERIES = {
     "mojo.txt": ("Mojo potrf, Mojo BLAS (SME2)", "#2a78d6", "#3987e5", "-"),
     "mojo-accelerate-blas.txt": ("Mojo potrf, BLAS of Accelerate",
                                  "#2a78d6", "#3987e5", "--"),
-    "accelerate.txt": ("Accelerate dpotrf", "#1baf7a", "#199e70", ":"),
+    "accelerate.txt": (f"Accelerate {P}potrf", "#1baf7a", "#199e70", ":"),
     "../numax.txt": ("numax (float64, row major)", "#9b51e0", "#b07cf0", "-"),
 }
 
@@ -59,8 +64,8 @@ def plot(order, theme, ymax):
     ax.set_ylim(0, ymax)
     ax.set_xlabel("n", color=t["ink2"])
     ax.set_ylabel("GFLOP/s", color=t["ink2"])
-    ax.set_title(f"DPOTRF, lower, {ORDERS[order]}\nApple M5", color=t["ink"],
-                 loc="left", fontsize=11)
+    ax.set_title(f"{P.upper()}POTRF, lower, {ORDERS[order]}\nApple M5",
+                 color=t["ink"], loc="left", fontsize=11)
     ax.grid(True, axis="y", color=t["grid"], linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
