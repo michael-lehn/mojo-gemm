@@ -528,14 +528,17 @@ major, row major and general strides, lower and upper.
 > starts in about five weeks.  The students do exercises on multithreading,
 > and it is a tradition that I show them something beyond: how things are
 > done in a PLASMA (Parallel Linear Algebra Software for Multicore
-> Architectures) style, except for copying matrices (I believe in rule 3 of
-> the [Power of
+> Architectures) style, except for copying matrices.  ulmBLAS never copied
+> matrices, only blocks of fixed size, which could be allocated at
+> initialization time.  I believe in rule 3 of the [Power of
 > Ten](https://en.wikipedia.org/wiki/The_Power_of_10:_Rules_for_Developing_Safety-Critical_Code)
-> from NASA: no dynamic memory allocation after initialization).  That is
-> what I am currently working on in ulmBLAS, and that is what I port here.
-> If the rule were one thread, I would have spent the time on a different
-> kernel.  The SME2 micro kernel was a hobby, I recently got a MacBook Air
-> with an M5.
+> from NASA: no dynamic memory allocation after initialization (as a student
+> at [USC](https://www.usc.edu) I did my master's thesis in a
+> [JPL](https://www.jpl.nasa.gov) project).  Multithreading the LAPACK layer
+> is what I am currently working on in ulmBLAS, and that is what I port
+> here.  If the rule were one thread, I would have spent the time on a
+> different kernel.  The SME2 micro kernel was a hobby, I recently got a
+> MacBook Air with an M5.
 
 Two BLAS backends, chosen at compile time:
 
