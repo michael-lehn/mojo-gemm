@@ -23,7 +23,7 @@ SERIES = {
     "mojo-accelerate-blas.txt": ("Mojo potrf, BLAS of Accelerate",
                                  "#2a78d6", "#3987e5", "--"),
     "accelerate.txt": (f"Accelerate {P}potrf", "#1baf7a", "#199e70", ":"),
-    "../numax.txt": ("numax (float64, row major)", "#9b51e0", "#b07cf0", "-"),
+    "../numax.txt": (f"numax (float{32 if SINGLE else 64}, row major)", "#9b51e0", "#b07cf0", "-"),
 }
 
 THEMES = {

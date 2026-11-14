@@ -9,8 +9,9 @@
 #  and numax (row major only).  Results in results-potrf/<order>/.
 #
 #      NUMAX=<numax benchmark binary> sh run-potrf-benchmarks.sh [n ...]
-#      sh run-potrf-benchmarks.sh --float [n ...]   (SPOTRF, in
-#                                                   results-potrf-float/)
+#      NUMAX32=<numax float32 benchmark binary> \
+#          sh run-potrf-benchmarks.sh --float [n ...]   (SPOTRF, in
+#                                                       results-potrf-float/)
 #
 #  NUMAX: bench_numax_cholesky.mojo of this repository built in a numax
 #  checkout (see there).  Without NUMAX numax is skipped.
@@ -23,7 +24,7 @@ F=""
 if [ "$1" = "--float" ]; then
     R=results-potrf-float
     F="--float"
-    NUMAX=""  # numax: float32 needs Apple's Metal toolchain to build
+    NUMAX="$NUMAX32"  # float32: needs Apple's Metal toolchain to build
     shift
 fi
 ACCELERATE=/System/Library/Frameworks/Accelerate.framework/Accelerate
@@ -37,5 +38,5 @@ for order in col row; do
     ./bench-potrf "$ACCELERATE" $F --order=$order "$@" > "$D/accelerate.txt"
 done
 if [ -n "$NUMAX" ]; then
-    "$NUMAX" "$@" > results-potrf/numax.txt
+    "$NUMAX" "$@" > $R/numax.txt
 fi

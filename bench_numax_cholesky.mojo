@@ -10,7 +10,8 @@
 #       bench/bench_numax_cholesky.mojo -o bench-numax-cholesky
 #   ./bench-numax-cholesky [n ...]        (default n = 50, 100, ..., 4000)
 #
-# DTYPE: float64 (change the comptime below for float32).  A(i, j) = 1 / (1
+# DTYPE: float64; for float32 change the comptime below (building needs
+# Apple's Metal toolchain: xcodebuild -downloadComponent MetalToolchain).  A(i, j) = 1 / (1
 # + |i - j|), A(i, i) = n (positive definite).  Per n one checked call
 # (400 random elements of L L^T against A), then 3 samples of at least
 # 0.2 s each, the median is reported.  The time includes what numax's API

@@ -17,7 +17,7 @@ picture):
   on top of it is faster than Apple Accelerate from about n = 200 on (with a
   second core for the work around the SME (Scalable Matrix Extension) unit,
   which Accelerate does not use).  In place, for any storage order.  The one in numax is currently 8
-  to 47 times slower, so this could go there.
+  to 47 times slower (float and double), so this could go there.
 - [Linear algebra mapping](#3-the-real-thing-to-solve-linear-algebra-mapping):
   my compiler ulm.lam, built on MLIR (Multi-Level Intermediate
   Representation), turns formulas as written in a paper into the code an
@@ -1080,9 +1080,9 @@ Notes:
 ### Benchmarks with 32 bit floats (single precision)
 
 The same for SPOTRF, with its own tuning step (`sh tune-potrf.sh --float`)
-and Accelerate's `spotrf` (also on one thread) for comparison.  numax is
-missing here: its float32 version needs Apple's Metal toolchain to build,
-which I have not installed.
+and Accelerate's `spotrf` (also on one thread) and numax (float32, row
+major only) for comparison.  To build numax for float32 you need Apple's
+Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results-potrf-float/col/gflops-dark.svg">
@@ -1091,17 +1091,17 @@ which I have not installed.
 
 GFLOP/s, lower, column major:
 
-| n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate spotrf |
-|---:|---:|---:|---:|
-| 100 | 53 | 43 | 65 |
-| 250 | 281 | 178 | 271 |
-| 500 | 725 | 429 | 617 |
-| 750 | 1074 | 684 | 856 |
-| 1000 | 1299 | 945 | 1061 |
-| 1500 | 1579 | 1288 | 1291 |
-| 2000 | 1601 | 1457 | 1464 |
-| 3000 | 1676 | 1501 | 1493 |
-| 4000 | 1483 | 1466 | 1373 |
+| n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate spotrf | numax (float32, row major) |
+|---:|---:|---:|---:|---:|
+| 100 | 53 | 43 | 65 | 2 |
+| 250 | 281 | 178 | 271 | 9 |
+| 500 | 725 | 429 | 617 | 22 |
+| 750 | 1074 | 684 | 856 | 37 |
+| 1000 | 1299 | 945 | 1061 | 53 |
+| 1500 | 1579 | 1288 | 1291 | 85 |
+| 2000 | 1601 | 1457 | 1464 | 99 |
+| 3000 | 1676 | 1501 | 1493 | 136 |
+| 4000 | 1483 | 1466 | 1373 | 151 |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results-potrf-float/row/gflops-dark.svg">
@@ -1110,17 +1110,17 @@ GFLOP/s, lower, column major:
 
 GFLOP/s, lower, row major:
 
-| n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate spotrf |
-|---:|---:|---:|---:|
-| 100 | 51 | 35 | 53 |
-| 250 | 251 | 142 | 206 |
-| 500 | 708 | 349 | 452 |
-| 750 | 1071 | 574 | 595 |
-| 1000 | 1310 | 830 | 761 |
-| 1500 | 1577 | 1118 | 901 |
-| 2000 | 1660 | 1258 | 1041 |
-| 3000 | 1652 | 1332 | 1003 |
-| 4000 | 1359 | 1365 | 1009 |
+| n | Mojo potrf, Mojo BLAS (SME2) | Mojo potrf, BLAS of Accelerate | Accelerate spotrf | numax (float32, row major) |
+|---:|---:|---:|---:|---:|
+| 100 | 51 | 35 | 53 | 2 |
+| 250 | 251 | 142 | 206 | 9 |
+| 500 | 708 | 349 | 452 | 22 |
+| 750 | 1071 | 574 | 595 | 37 |
+| 1000 | 1310 | 830 | 761 | 53 |
+| 1500 | 1577 | 1118 | 901 | 85 |
+| 2000 | 1660 | 1258 | 1041 | 99 |
+| 3000 | 1652 | 1332 | 1003 | 136 |
+| 4000 | 1359 | 1365 | 1009 | 151 |
 
 What this shows:
 
@@ -1135,6 +1135,7 @@ What this shows:
   blocks, copies) counts twice as much.
 - With only the BLAS of Accelerate it reaches on average 97% of `spotrf`
   for n >= 1000 column major, and is on average 26% faster row major.
+- numax is 9 to 46 times slower (n >= 250), about the same as for double.
 - Small matrices are open here too: at n = 100, 81% of Accelerate column
   major, 96% row major.
 
