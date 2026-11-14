@@ -2,3 +2,5 @@
 bench
 test-gemm
 gemm
+bench-potrf
+test-potrf

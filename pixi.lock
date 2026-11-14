@@ -54,6 +54,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.7.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.2.0-release.conda
+      - conda: https://conda.modular.com/max/osx-arm64/max-core-26.7.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-1.2.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.2.0-release.conda
 packages:
@@ -581,6 +582,15 @@ packages:
   run_exports: {}
   size: 26506
   timestamp: 1792101239805
+- conda: https://conda.modular.com/max/osx-arm64/max-core-26.7.0-release.conda
+  sha256: ca2d44800f0bac0a55233b98e99d1b3eb87c48794b13b52076f0d90dea24862a
+  md5: d38434dfeb02b0da2da1e677ffd7c238
+  depends:
+  - mojo-compiler ==1.2.0
+  license: LicenseRef-Modular-Proprietary
+  run_exports: {}
+  size: 76067006
+  timestamp: 1792189867599
 - conda: https://conda.modular.com/max/osx-arm64/mojo-1.2.0-release.conda
   sha256: 15a11e832acae6cb52b32541d35d4feab608f265c6f8fb4b2d3569d7eeebd55c
   md5: fb8048363ef43fd17dd38e4837041d7c

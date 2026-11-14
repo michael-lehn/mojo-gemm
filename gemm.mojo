@@ -19,7 +19,7 @@
 
 from std.math import ceildiv
 
-from ugemm_sme import ugemm_sme, MR_SME, NR_SME, fpsr_get, fpsr_set
+from ugemm_sme import ugemm_sme, mgemm_sme, MR_SME, NR_SME, fpsr_get, fpsr_set
 
 comptime f64 = DType.float64
 comptime Ptr = MutPointer[Float64, MutUntrackedOrigin]
@@ -38,6 +38,7 @@ comptime NEON = Config(960, 1024, 4080, 8, 6)
 comptime SME2 = Config(384, 1024, 1024, MR_SME, NR_SME)
 
 comptime KUNROLL = 4  # unrolling of the loop over k in the NEON kernel
+comptime PV = 8  # SIMD width for packing partial panels
 
 
 # ---------------------------------------------------------------------------
@@ -45,10 +46,13 @@ comptime KUNROLL = 4  # unrolling of the loop over k in the NEON kernel
 # ---------------------------------------------------------------------------
 
 
-# A_ = mc x kc block of A in MR-row panels: panel p holds A(p*MR + i, l) at
-# A_[p*MR*kc + l*MR + i]; the last panel is zero padded.
+# A_ = alpha times the mc x kc block of A in MR-row panels: panel p holds
+# alpha*A(p*MR + i, l) at A_[p*MR*kc + l*MR + i]; the last panel is zero
+# padded.  With alpha in the packed panels the micro kernel is called with
+# alpha = 1, which is the case of the direct path of the SME2 kernel.
 def pack_A[MR: Int](
-    mc: Int, kc: Int, A: Ptr, incRowA: Int, incColA: Int, A_: Ptr
+    mc: Int, kc: Int, alpha: Float64, A: Ptr, incRowA: Int, incColA: Int,
+    A_: Ptr,
 ):
     var mp = ceildiv(mc, MR)
     for p in range(mp):
@@ -58,14 +62,30 @@ def pack_A[MR: Int](
         if mr == MR and incRowA == 1:
             for l in range(kc):
                 var a = A.unsafe_load[width=MR](i0 + l * incColA)
-                P.unsafe_store(l * MR, a)
+                P.unsafe_store(l * MR, alpha * a)
+        elif incRowA == 1:
+            # partial panel, columns contiguous: vectors of PV, then the rest
+            for l in range(kc):
+                var a = A.unsafe_offset(i0 + l * incColA)
+                var p = P.unsafe_offset(l * MR)
+                var i = 0
+                while i + PV <= mr:
+                    p.unsafe_store(i, alpha * a.unsafe_load[width=PV](i))
+                    i += PV
+                while i < mr:
+                    p[unsafe_offset=i] = alpha * a[unsafe_offset=i]
+                    i += 1
+                while i < MR:
+                    p[unsafe_offset=i] = 0.0
+                    i += 1
         else:
             for l in range(kc):
-                for i in range(MR):
+                for i in range(mr):
                     P[unsafe_offset=l * MR + i] = (
-                        A[unsafe_offset=(i0 + i) * incRowA + l * incColA]
-                        if i < mr else 0.0
+                        alpha * A[unsafe_offset=(i0 + i) * incRowA + l * incColA]
                     )
+                for i in range(mr, MR):
+                    P[unsafe_offset=l * MR + i] = 0.0
 
 
 # B_ = kc x nc block of B in NR-column panels: panel q holds B(l, q*NR + j)
@@ -78,12 +98,37 @@ def pack_B[NR: Int](
         var P = B_.unsafe_offset(q * NR * kc)
         var j0 = q * NR
         var nr = min(NR, nc - j0)
-        for l in range(kc):
-            for j in range(NR):
-                P[unsafe_offset=l * NR + j] = (
-                    B[unsafe_offset=l * incRowB + (j0 + j) * incColB]
-                    if j < nr else 0.0
-                )
+        comptime if NR & (NR - 1) == 0:  # SIMD width: a power of two
+            if nr == NR and incColB == 1:
+                # rows of the panel are contiguous: SIMD loads
+                for l in range(kc):
+                    var b = B.unsafe_load[width=NR](l * incRowB + j0)
+                    P.unsafe_store(l * NR, b)
+                continue
+        if incColB == 1:
+            # partial panel, rows contiguous: vectors of PV, then the rest
+            for l in range(kc):
+                var b = B.unsafe_offset(l * incRowB + j0)
+                var p = P.unsafe_offset(l * NR)
+                var j = 0
+                while j + PV <= nr:
+                    p.unsafe_store(j, b.unsafe_load[width=PV](j))
+                    j += PV
+                while j < nr:
+                    p[unsafe_offset=j] = b[unsafe_offset=j]
+                    j += 1
+                while j < NR:
+                    p[unsafe_offset=j] = 0.0
+                    j += 1
+        else:
+            # column by column (contiguous reads if incRowB = 1)
+            for j in range(nr):
+                var b = B.unsafe_offset((j0 + j) * incColB)
+                for l in range(kc):
+                    P[unsafe_offset=l * NR + j] = b[unsafe_offset=l * incRowB]
+            for l in range(kc):
+                for j in range(nr, NR):
+                    P[unsafe_offset=l * NR + j] = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +193,10 @@ def mgemm[MR: Int, NR: Int, SME: Bool](
     mc: Int, nc: Int, kc: Int, alpha: Float64, A_: Ptr, B_: Ptr,
     beta: Float64, C: Ptr, incRowC: Int, incColC: Int,
 ):
+    comptime if SME:
+        if alpha == 1.0:  # always the case: gemm puts alpha into A_
+            mgemm_sme(mc, nc, kc, A_, B_, beta, C, incRowC, incColC)
+            return
     var jr = 0
     while jr < nc:
         var nr = min(NR, nc - jr)
@@ -240,6 +289,14 @@ def gemm[SME: Bool](
         gescal(m, n, beta, C, incRowC, incColC)
         return
 
+    # The streaming macro kernel handles beta = 0 and beta = 1 in place: any
+    # other beta is applied here, in ordinary mode.
+    var beta0 = beta
+    comptime if SME:
+        if beta != 0.0 and beta != 1.0:
+            gescal(m, n, beta, C, incRowC, incColC)
+            beta0 = 1.0
+
     # packing buffers for the blocks of this problem
     var mc_max = min(MC, ceildiv(m, MR) * MR)
     var nc_max = min(NC, ceildiv(n, NR) * NR)
@@ -260,7 +317,7 @@ def gemm[SME: Bool](
         var pc = 0
         while pc < k:
             var kc = min(KC, k - pc)
-            var beta_ = beta if pc == 0 else 1.0
+            var beta_ = beta0 if pc == 0 else 1.0
             pack_B[NR](
                 kc, nc, B.unsafe_offset(pc * incRowB + jc * incColB),
                 incRowB, incColB, B_,
@@ -269,11 +326,12 @@ def gemm[SME: Bool](
             while ic < m:
                 var mc = min(MC, m - ic)
                 pack_A[MR](
-                    mc, kc, A.unsafe_offset(ic * incRowA + pc * incColA),
+                    mc, kc, alpha, A.unsafe_offset(ic * incRowA + pc * incColA),
                     incRowA, incColA, A_,
                 )
+                # alpha is in A_
                 mgemm[MR, NR, SME](
-                    mc, nc, kc, alpha, A_, B_, beta_,
+                    mc, nc, kc, 1.0, A_, B_, beta_,
                     C.unsafe_offset(ic * incRowC + jc * incColC),
                     incRowC, incColC,
                 )

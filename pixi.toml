@@ -7,6 +7,9 @@ version = "0.1.0"
 [tasks]
 build = "mojo build -O3 -I . bench.mojo -o bench"
 test = "mojo build -O3 -I . test.mojo -o test-gemm && ./test-gemm neon && ./test-gemm sme"
+build-potrf = "mojo build -O3 -I . -Xlinker -framework -Xlinker Accelerate bench_potrf.mojo -o bench-potrf"
+test-potrf = "mojo build -O3 -I . -Xlinker -framework -Xlinker Accelerate test_potrf.mojo -o test-potrf && ./test-potrf neon && ./test-potrf sme && VECLIB_MAXIMUM_THREADS=1 ./test-potrf accelerate && ./test-potrf pk && ./test-potrf pk3"
 
 [dependencies]
 mojo = ">=1.2.0,<2"
+max-core = "==26.7"
