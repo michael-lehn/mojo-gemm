@@ -37,7 +37,8 @@ from max.algorithm import sync_parallelize
 
 from gemm import Ptr, PtrT, Workspace, gemm
 from ugemm_sme import (fpsr_get, fpsr_set, pk_offset, pk_solve, pk_update,
-                       pk_solve32, pk_update32, PtrF)
+                       pk_solve32, pk_update32, PtrF, pk_update_w,
+                       pk_update_w32, pk_correct, pk_correct32)
 from level12 import V, dot, gemv, scal
 from potrf_select import potrf_select
 
@@ -800,6 +801,28 @@ def pk_slv[dt: DType](buf: PtrT[dt], T: PtrT[dt], Linv: PtrT[dt], K: Int,
                  P0)
 
 
+# Multi-column update and correction (ugemm_sme.mojo) for double or float.
+@always_inline
+def pk_updw[dt: DType](buf: PtrT[dt], Tb: PtrT[dt], TS: Int, nT: Int, K: Int,
+                       c1: Int, P0: Int, P1: Int):
+    comptime if dt == f32:
+        pk_update_w32(rebind[PtrF](buf), rebind[PtrF](Tb), TS, nT, K, c1, P0,
+                      P1)
+    else:
+        pk_update_w(rebind[Ptr](buf), rebind[Ptr](Tb), TS, nT, K, c1, P0, P1)
+
+
+@always_inline
+def pk_corr[dt: DType](buf: PtrT[dt], Tb: PtrT[dt], TS: Int, nT: Int, s0: Int,
+                       s1: Int, c: Int, P0: Int, P1: Int):
+    comptime if dt == f32:
+        pk_correct32(rebind[PtrF](buf), rebind[PtrF](Tb), TS, nT, s0, s1, c,
+                     c + 1, P0, P1)
+    else:
+        pk_correct(rebind[Ptr](buf), rebind[Ptr](Tb), TS, nT, s0, s1, c,
+                   c + 1, P0, P1)
+
+
 # Cholesky of the lower triangle for small n (SME2 only): the lower triangle
 # is copied once into panels of 32 rows (zero padded, so that all tiles are
 # full; see pk_offset), then for each block column K (32 columns):
@@ -829,8 +852,8 @@ def potrf_pk[dt: DType](n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
     for K in range(np):
         var bw = min(32, n - 32 * K)
         # T(P) = updated block (P, K), P >= K
-        if K > 0:
-            pk_upd(buf, T, K, np)
+        if K > 0:  # (with prefetch of the next panel)
+            pk_updw(buf, T, np * 1024, 1, K, K + 1, K, np)
             fpsr_set(fpsr)
         else:
             for P in range(np):  # block column 0: nothing to update
@@ -868,8 +891,8 @@ struct PkShared[dt: DType](ImplicitlyCopyable):
     var n: Int
     var np: Int
     var buf: PtrT[Self.dt]
-    var T0: PtrT[Self.dt]
-    var T1: PtrT[Self.dt]
+    var Tb: PtrT[Self.dt]  # T(c) = Tb + (c % nT) * np * 1024
+    var nT: Int  # w + 1 (w: block columns per pass over L)
     var L0: PtrT[Self.dt]
     var L1: PtrT[Self.dt]
     var X: PtrT[Self.dt]
@@ -880,7 +903,7 @@ struct PkShared[dt: DType](ImplicitlyCopyable):
     var incColA: Int
 
     def T(self, K: Int) -> PtrT[Self.dt]:
-        return self.T0 if K % 2 == 0 else self.T1
+        return self.Tb.unsafe_offset((K % self.nT) * self.np * 1024)
 
     def Linv(self, K: Int) -> PtrT[Self.dt]:
         return self.L0 if K % 2 == 0 else self.L1
@@ -903,34 +926,56 @@ struct PkShared[dt: DType](ImplicitlyCopyable):
             self.flags.unsafe_offset(2), expected, Int64(info)
         )
 
+    # Step K (Linv(K) ready): solve block column K, complete T(K+1) (its
+    # diagonal block first, then signal), and the rest.  Every w-th step
+    # (step Kb) reads L once for the w block columns Kb+1 .. Kb+w (pk_updw
+    # with L(:, 0:Kb+1)); in the steps K in between, T(K+1) gets what is
+    # missing, L(:, Kb+1:K+1) L(K+1, Kb+1:K+1)^T, in one call per block
+    # (pk_corr).
     def sme_work(self):
         var fpsr = fpsr_get()
+        var TS = self.np * 1024
+        var w = self.nT - 1
+        var last = 0  # block columns up to last have a (partial) T
+        var Kb = 0  # step of the last pass over L
         for K in range(self.np - 1):
-            # Linv(K) and the diagonal block K
             while load(self.flags, 1) < K + 1:
                 if load(self.flags, 2) != 0:
                     fpsr_set(fpsr)
                     return
             var Tc = self.T(K)
-            var Tn = self.T(K + 1)
             pk_slv(self.buf, Tc, self.Linv(K), K, K + 2, K + 1)
-            pk_upd(self.buf, Tn, K + 1, K + 2, K + 1)
-            increment(self.flags, 0)  # diagonal block K+1 ready
-            pk_slv(self.buf, Tc, self.Linv(K), K, self.np, K + 2)
-            pk_upd(self.buf, Tn, K + 1, self.np, K + 2)
+            if K + 1 > last:  # pass over L for K+1 .. last
+                last = min(K + w, self.np - 1)
+                Kb = K
+                pk_updw(self.buf, self.Tb, TS, self.nT, K + 1, K + 2, K + 1,
+                        K + 2)
+                increment(self.flags, 0)  # diagonal block K+1 ready
+                pk_slv(self.buf, Tc, self.Linv(K), K, self.np, K + 2)
+                pk_updw(self.buf, self.Tb, TS, self.nT, K + 1, last + 1,
+                        K + 2, self.np)
+            else:  # complete T(K+1) with block columns Kb+1 .. K
+                pk_corr(self.buf, self.Tb, TS, self.nT, Kb + 1, K + 1, K + 1,
+                        K + 1, K + 2)
+                increment(self.flags, 0)  # diagonal block K+1 ready
+                pk_slv(self.buf, Tc, self.Linv(K), K, self.np, K + 2)
+                pk_corr(self.buf, self.Tb, TS, self.nT, Kb + 1, K + 1, K + 1,
+                        K + 2, self.np)
+            fpsr_set(fpsr)
         fpsr_set(fpsr)
 
-    # Besides the diagonal blocks the worker copies block column K+1 into
-    # the panels (needed from SME step K+1 on; published by the flag of
+    # Besides the diagonal blocks the worker copies block column K+w into
+    # the panels (needed from SME step K on; published by the flag of
     # diagonal block K, which the SME thread waits for) and block column
     # K-2 back into A (final: the SME thread is past step K-2 when it
-    # signals diagonal block K).  The caller copies block columns 0 and 1
+    # signals diagonal block K).  The caller copies block columns 0 .. w
     # in and the last two out.
     def core_work(self):
+        var w = self.nT - 1
         for K in range(1, self.np):
-            if K + 1 < self.np:
+            if K + w < self.np:
                 pk_copy_in(self.n, self.np, self.A, self.incRowA,
-                           self.incColA, self.buf, K + 1, K + 2)
+                           self.incColA, self.buf, K + w, K + w + 1)
             while load(self.flags, 0) < K:
                 if load(self.flags, 2) != 0:
                     return
@@ -947,6 +992,7 @@ struct PkShared[dt: DType](ImplicitlyCopyable):
 # potrf_pk3: control block of the worker thread (Int64 entries): job
 # counter, jobs done, stop flag, then the fields of the PkShared of the
 # current job (the last one: 1 for float).
+comptime PK3_W = 1  # potrf_pk3: default block columns per pass over L
 comptime CTL_JOB = 0
 comptime CTL_DONE = 1
 comptime CTL_STOP = 2
@@ -963,7 +1009,7 @@ def run_job[dt: DType](c: IPtr):
     var b = CTL_SHARED
     var g = PkShared[dt](
         Int(c[unsafe_offset=b]), Int(c[unsafe_offset=b + 1]),
-        ptr_at[dt](c, b + 2), ptr_at[dt](c, b + 3), ptr_at[dt](c, b + 4),
+        ptr_at[dt](c, b + 2), ptr_at[dt](c, b + 3), Int(c[unsafe_offset=b + 4]),
         ptr_at[dt](c, b + 5), ptr_at[dt](c, b + 6), ptr_at[dt](c, b + 7),
         ptr_at[dt](c, b + 8),
         IPtr(unsafe_from_address=Int(c[unsafe_offset=b + 9])),
@@ -1003,18 +1049,19 @@ def pk_thread_main(arg: Int) abi("C") -> Int:
 # pk_thread_main).
 @no_inline
 def potrf_pk3[dt: DType](n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
-                         mut pk: PotrfContext[dt]) -> Int:
+                         mut pk: PotrfContext[dt], w: Int = PK3_W) -> Int:
     if n <= 0:
         return 0
     var np = ceildiv(n, 32)
     pk.reserve(np)
-    if len(pk.T2) < 1024 * np:
-        pk.T2 = List[Scalar[dt]](length=1024 * np, fill=0.0)
+    if len(pk.T2) < (w + 1) * 1024 * np:
+        pk.T2 = List[Scalar[dt]](length=(w + 1) * 1024 * np, fill=0.0)
+    if len(pk.Linv2) < 1024:
         pk.Linv2 = List[Scalar[dt]](length=1024, fill=0.0)
     pk.start()
     var buf = uptr(pk.buf)
-    pk_copy_in(n, np, A, incRowA, incColA, buf, 0, min(np, 2))
-    var g = PkShared[dt](n, np, buf, uptr(pk.T), uptr(pk.T2), uptr(pk.Linv),
+    pk_copy_in(n, np, A, incRowA, incColA, buf, 0, min(np, w + 1))
+    var g = PkShared[dt](n, np, buf, uptr(pk.T2), w + 1, uptr(pk.Linv),
                          uptr(pk.Linv2), uptr(pk.X), uptr(pk.d),
                          iptr(pk.flags), A, incRowA, incColA)
     for i in range(3):
@@ -1035,8 +1082,8 @@ def potrf_pk3[dt: DType](n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
         c[unsafe_offset=b] = Int64(n)
         c[unsafe_offset=b + 1] = Int64(np)
         c[unsafe_offset=b + 2] = Int64(Int(g.buf))
-        c[unsafe_offset=b + 3] = Int64(Int(g.T0))
-        c[unsafe_offset=b + 4] = Int64(Int(g.T1))
+        c[unsafe_offset=b + 3] = Int64(Int(g.Tb))
+        c[unsafe_offset=b + 4] = Int64(g.nT)
         c[unsafe_offset=b + 5] = Int64(Int(g.L0))
         c[unsafe_offset=b + 6] = Int64(Int(g.L1))
         c[unsafe_offset=b + 7] = Int64(Int(g.X))
@@ -1054,10 +1101,10 @@ def potrf_pk3[dt: DType](n: Int, A: PtrT[dt], incRowA: Int, incColA: Int,
         info = Int(pk.flags[2])
     if info == 0:  # the worker copied out block columns 0 .. np-3
         pk_copy_out(n, np, A, incRowA, incColA, buf, max(np - 2, 0))
-    else:  # failed in block column (info-1)/32: columns up to two further
+    else:  # failed in block column (info-1)/32: columns up to w further
         # on are in the panels, the others were never copied in
         pk_copy_out(n, np, A, incRowA, incColA, buf, 0,
-                    min(np, (info - 1) // 32 + 2))
+                    min(np, (info - 1) // 32 + w + 1))
     return info
 
 
@@ -1165,7 +1212,7 @@ def potrf[SME: Bool, ACC: Int = 0, dt: DType = f64](
             var cl = incColA if lower else incRowA
             if c[0] == ALG_PK:
                 return potrf_pk(n, A, r, cl, ctx)
-            return potrf_pk3(n, A, r, cl, ctx)
+            return potrf_pk3(n, A, r, cl, ctx, max(c[2], 1))  # nb: w
     return potrf_tiles[SME, ACC, dt](lower, n, A, incRowA, incColA, c[2],
                                      c[1])
 

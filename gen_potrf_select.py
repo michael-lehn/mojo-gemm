@@ -12,7 +12,8 @@ without tuning data uses the configurations of double.
 Files of a backend directory:
     t<T>-nb<NB>.txt   tiles and tasks, T threads, tile size NB
     pk.txt            pack once (one thread)
-    pk3.txt           pack once with lookahead (two threads)
+    pk3-wW.txt        pack once with lookahead (two threads), W block
+                      columns per pass over L
 """
 
 import pathlib
@@ -47,8 +48,8 @@ def configs(d):
             runs[(ALG["tiles"], int(m[1]), int(m[2]))] = read(p)
         elif p.stem == "pk":
             runs[(ALG["pk"], 1, 0)] = read(p)
-        elif p.stem == "pk3":
-            runs[(ALG["pk3"], 2, 0)] = read(p)
+        elif re.fullmatch(r"pk3-w\d+", p.stem):
+            runs[(ALG["pk3"], 2, int(p.stem[5:]))] = read(p)
     return runs
 
 
@@ -60,7 +61,11 @@ def best_configs(d):
         top = max(r[n] for r in runs.values())
         ok = [(c, r[n]) for c, r in runs.items()
               if r[n] >= (1 - TOLERANCE) * top]
-        c, g = min(ok, key=lambda x: (x[0][1], -x[1]))
+        # fewer threads first; for potrf_pk3 fewer block columns per pass
+        # (nb), so that the choice does not flip with noise
+        c, g = min(ok, key=lambda x: (x[0][1],
+                                      x[0][2] if x[0][0] == ALG["pk3"] else 0,
+                                      -x[1]))
         best.append((n, c, g))
     return best
 
@@ -103,7 +108,8 @@ def main():
            "# potrf_select[SME, ACC, dt](n) -> (algorithm, nthreads, nb): the",
            "# configuration potrf uses for nthreads = 0.  Algorithm: 0 tiles",
            "# and tasks, 1 pack once (potrf_pk), 2 pack once with lookahead",
-           "# (potrf_pk3).", "", "",
+           "# (potrf_pk3); for potrf_pk3 nb is the number of block",
+           "# columns per pass over L.", "", "",
            "def potrf_select[SME: Bool, ACC: Int, dt: DType = DType.float64]("
            "n: Int) -> Tuple[",
            "    Int, Int, Int",

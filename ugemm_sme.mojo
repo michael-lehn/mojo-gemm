@@ -660,6 +660,70 @@ comptime KERNEL_PK_UPD = """
     b.lt 3b
 """
 
+# The same with a software prefetch into L2: $5 address, $6 stride in bytes
+# per k iteration (one prfm per iteration).
+comptime KERNEL_PK_UPD_PF = """
+    ptrue p0.d
+    ptrue pn8.d
+    mov x9, $1
+    mov x10, $2
+    mov x11, $0
+    mov w12, #0
+    mov x13, $3
+    mov x16, $5
+    mov x17, $6
+1:
+    add x14, x13, #2048
+    add w15, w12, #4
+    ldr za[w12, 0], [x13]
+    ldr za[w12, 1], [x13, #1, mul vl]
+    ldr za[w12, 2], [x13, #2, mul vl]
+    ldr za[w12, 3], [x13, #3, mul vl]
+    ldr za[w15, 0], [x14]
+    ldr za[w15, 1], [x14, #1, mul vl]
+    ldr za[w15, 2], [x14, #2, mul vl]
+    ldr za[w15, 3], [x14, #3, mul vl]
+    add x13, x13, #256
+    add w12, w12, #8
+    cmp w12, #64
+    b.lt 1b
+2:
+    ld1d {z0.d-z3.d}, pn8/z, [x9]
+    ld1d {z4.d-z5.d}, pn8/z, [x10]
+    fmops za0.d, p0/m, p0/m, z4.d, z0.d
+    fmops za1.d, p0/m, p0/m, z4.d, z1.d
+    fmops za2.d, p0/m, p0/m, z4.d, z2.d
+    fmops za3.d, p0/m, p0/m, z4.d, z3.d
+    fmops za4.d, p0/m, p0/m, z5.d, z0.d
+    fmops za5.d, p0/m, p0/m, z5.d, z1.d
+    fmops za6.d, p0/m, p0/m, z5.d, z2.d
+    fmops za7.d, p0/m, p0/m, z5.d, z3.d
+    prfm pldl2keep, [x16]
+    add x16, x16, x17
+    add x9, x9, #256
+    add x10, x10, #256
+    subs x11, x11, #1
+    b.ne 2b
+    mov w12, #0
+    mov x13, $4
+3:
+    add x14, x13, #2048
+    add w15, w12, #4
+    str za[w12, 0], [x13]
+    str za[w12, 1], [x13, #1, mul vl]
+    str za[w12, 2], [x13, #2, mul vl]
+    str za[w12, 3], [x13, #3, mul vl]
+    str za[w15, 0], [x14]
+    str za[w15, 1], [x14, #1, mul vl]
+    str za[w15, 2], [x14, #2, mul vl]
+    str za[w15, 3], [x14, #3, mul vl]
+    add x13, x13, #256
+    add w12, w12, #8
+    cmp w12, #64
+    b.lt 3b
+"""
+
+
 # $0 kc (>= 1), $1 A, $2 B (16 rows of a panel), $3 C: C = A B^T
 comptime KERNEL_PK_SLV = """
     ptrue p0.d
@@ -708,6 +772,14 @@ def kernel_pk_upd(kc: Int, A: Ptr, B: Ptr, Cin: Ptr, Cout: Ptr):
     inlined_assembly[
         KERNEL_PK_UPD, NoneType, constraints="r,r,r,r,r," + CLOBBERS
     ](kc, A, B, Cin, Cout)
+
+
+@always_inline
+def kernel_pk_upd_pf(kc: Int, A: Ptr, B: Ptr, Cin: Ptr, Cout: Ptr, pf: Ptr,
+                     stride: Int):
+    inlined_assembly[
+        KERNEL_PK_UPD_PF, NoneType, constraints="r,r,r,r,r,r,r," + CLOBBERS
+    ](kc, A, B, Cin, Cout, pf, stride)
 
 
 @always_inline
@@ -812,6 +884,56 @@ comptime KERNEL32_PK_UPD = """
     b.lt 3b
 """
 
+
+# The same with a software prefetch into L2: $5 address, $6 stride in bytes
+# per k iteration (one prfm per iteration).
+comptime KERNEL32_PK_UPD_PF = """
+    ptrue p0.s
+    ptrue pn8.s
+    mov x9, $1
+    mov x10, $2
+    mov x11, $0
+    mov w12, #0
+    mov x13, $3
+    mov x16, $5
+    mov x17, $6
+1:
+    add x14, x13, #1920
+    ldr za[w12, 0], [x13]
+    ldr za[w12, 1], [x13, #1, mul vl]
+    ldr za[w12, 2], [x14, #2, mul vl]
+    ldr za[w12, 3], [x14, #3, mul vl]
+    add x13, x13, #128
+    add w12, w12, #4
+    cmp w12, #64
+    b.lt 1b
+2:
+    ld1w {z0.s-z1.s}, pn8/z, [x9]
+    ld1w {z2.s-z3.s}, pn8/z, [x10]
+    fmops za0.s, p0/m, p0/m, z2.s, z0.s
+    fmops za1.s, p0/m, p0/m, z2.s, z1.s
+    fmops za2.s, p0/m, p0/m, z3.s, z0.s
+    fmops za3.s, p0/m, p0/m, z3.s, z1.s
+    prfm pldl2keep, [x16]
+    add x16, x16, x17
+    add x9, x9, #128
+    add x10, x10, #128
+    subs x11, x11, #1
+    b.ne 2b
+    mov w12, #0
+    mov x13, $4
+3:
+    add x14, x13, #1920
+    str za[w12, 0], [x13]
+    str za[w12, 1], [x13, #1, mul vl]
+    str za[w12, 2], [x14, #2, mul vl]
+    str za[w12, 3], [x14, #3, mul vl]
+    add x13, x13, #128
+    add w12, w12, #4
+    cmp w12, #64
+    b.lt 3b
+"""
+
 # $0 kc (>= 1), $1 A, $2 B (32 rows of a panel), $3 C: C = A B^T
 comptime KERNEL32_PK_SLV = """
     ptrue p0.s
@@ -844,6 +966,14 @@ comptime KERNEL32_PK_SLV = """
     cmp w12, #64
     b.lt 3b
 """
+
+
+@always_inline
+def kernel32_pk_upd_pf(kc: Int, A: PtrF, B: PtrF, Cin: PtrF, Cout: PtrF,
+                       pf: PtrF, stride: Int):
+    inlined_assembly[
+        KERNEL32_PK_UPD_PF, NoneType, constraints="r,r,r,r,r,r,r," + CLOBBERS
+    ](kc, A, B, Cin, Cout, pf, stride)
 
 
 @always_inline
@@ -882,4 +1012,100 @@ def pk_solve32(buf: PtrF, T: PtrF, Linv: PtrF, K: Int, np: Int,
     for P in range(K + 1 if P0 < 0 else P0, np):
         kernel32_pk_slv(32, T.unsafe_offset((P - K) * 1024), Linv,
                         buf.unsafe_offset(pk_offset(P) + K * 1024))
+    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
+
+
+# ---------------------------------------------------------------------------
+# Multi-column updates of potrf_pk3 (double and float).  The updated blocks
+# of block column c are in T(c) = Tb + (c % nT) * TS, block (P, c) at
+# T(c) + (P - c) * 1024.
+#
+# pk_update_w: T(c)(P) = C(P, c) - L(P, 0:32K) L(c, 0:32K)^T for the block
+# columns c = K .. c1-1 and the panels P = P0 .. P1-1, P >= c.  Panel P of L
+# is read once for all c (from the cache for the second and further c).
+#
+# pk_correct: T(c)(P) -= L(P, s0:s1) L(c, s0:s1)^T (block columns s0 ..
+# s1-1, kc = 32 (s1 - s0)) for c = c0 .. c1-1 and P = P0 .. P1-1, P >= c.
+# ---------------------------------------------------------------------------
+@__llvm_metadata(`llvm.arm_streaming`)
+@no_inline
+def pk_update_w(buf: Ptr, Tb: Ptr, TS: Int, nT: Int, K: Int, c1: Int,
+                P0: Int, P1: Int):
+    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
+    var kc = 32 * K
+    for P in range(P0, P1):
+        var Ap = buf.unsafe_offset(pk_offset(P))
+        # prefetch L(P+1, 0:kc) (2 kc lines of 128 bytes), spread over the
+        # 2 w calls for this panel
+        var w = min(c1, P + 1) - K
+        var pf = buf.unsafe_offset(pk_offset(min(P + 1, P1 - 1)))
+        var stride = 128 // w if w > 0 else 0
+        var j = 0
+        for c in range(K, min(c1, P + 1)):
+            var Bc = buf.unsafe_offset(pk_offset(c))
+            var C = Ap.unsafe_offset(c * 1024)
+            var Tp = Tb.unsafe_offset((c % nT) * TS + (P - c) * 1024)
+            kernel_pk_upd_pf(kc, Ap, Bc, C, Tp,
+                             pf.unsafe_offset(j * kc * stride // 8), stride)
+            kernel_pk_upd_pf(kc, Ap, Bc.unsafe_offset(16), C.unsafe_offset(512),
+                             Tp.unsafe_offset(512),
+                             pf.unsafe_offset((j + 1) * kc * stride // 8),
+                             stride)
+            j += 2
+    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
+
+
+@__llvm_metadata(`llvm.arm_streaming`)
+@no_inline
+def pk_correct(buf: Ptr, Tb: Ptr, TS: Int, nT: Int, s0: Int, s1: Int,
+               c0: Int, c1: Int, P0: Int, P1: Int):
+    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
+    var kc = 32 * (s1 - s0)
+    for P in range(P0, P1):
+        var Ap = buf.unsafe_offset(pk_offset(P) + s0 * 1024)
+        for c in range(c0, min(c1, P + 1)):
+            var Bc = buf.unsafe_offset(pk_offset(c) + s0 * 1024)
+            var Tp = Tb.unsafe_offset((c % nT) * TS + (P - c) * 1024)
+            kernel_pk_upd(kc, Ap, Bc, Tp, Tp)
+            kernel_pk_upd(kc, Ap, Bc.unsafe_offset(16), Tp.unsafe_offset(512),
+                          Tp.unsafe_offset(512))
+    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
+
+
+@__llvm_metadata(`llvm.arm_streaming`)
+@no_inline
+def pk_update_w32(buf: PtrF, Tb: PtrF, TS: Int, nT: Int, K: Int, c1: Int,
+                  P0: Int, P1: Int):
+    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
+    var kc = 32 * K
+    for P in range(P0, P1):
+        var Ap = buf.unsafe_offset(pk_offset(P))
+        # prefetch L(P+1, 0:kc) (kc lines of 128 bytes), spread over the w
+        # calls for this panel
+        var w = min(c1, P + 1) - K
+        var pf = buf.unsafe_offset(pk_offset(min(P + 1, P1 - 1)))
+        var stride = 128 // w if w > 0 else 0
+        var j = 0
+        for c in range(K, min(c1, P + 1)):
+            kernel32_pk_upd_pf(kc, Ap, buf.unsafe_offset(pk_offset(c)),
+                               Ap.unsafe_offset(c * 1024),
+                               Tb.unsafe_offset((c % nT) * TS + (P - c) * 1024),
+                               pf.unsafe_offset(j * kc * stride // 4), stride)
+            j += 1
+    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
+
+
+@__llvm_metadata(`llvm.arm_streaming`)
+@no_inline
+def pk_correct32(buf: PtrF, Tb: PtrF, TS: Int, nT: Int, s0: Int, s1: Int,
+                 c0: Int, c1: Int, P0: Int, P1: Int):
+    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
+    var kc = 32 * (s1 - s0)
+    for P in range(P0, P1):
+        var Ap = buf.unsafe_offset(pk_offset(P) + s0 * 1024)
+        for c in range(c0, min(c1, P + 1)):
+            var Tp = Tb.unsafe_offset((c % nT) * TS + (P - c) * 1024)
+            kernel32_pk_upd(kc, Ap,
+                            buf.unsafe_offset(pk_offset(c) + s0 * 1024), Tp,
+                            Tp)
     inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()

@@ -16,6 +16,13 @@
 #  NUMAX: bench_numax_cholesky.mojo of this repository built in a numax
 #  checkout (see there).  Without NUMAX numax is skipped.
 #
+#  PAUSE=<seconds>: pause before each run, so that the MacBook Air (no
+#  fan) can cool down; default 0.
+#
+#  OPENBLAS=<path of libopenblas.dylib>: also OpenBLAS's dpotrf (spotrf),
+#  with its default number of threads (openblas.txt) and with one thread
+#  (openblas-1.txt).  Without OPENBLAS OpenBLAS is skipped.
+#
 set -e
 cd "$(dirname "$0")"
 pixi run build-potrf
@@ -28,14 +35,25 @@ if [ "$1" = "--float" ]; then
     shift
 fi
 ACCELERATE=/System/Library/Frameworks/Accelerate.framework/Accelerate
+pause() { sleep "${PAUSE:-0}"; }
 export VECLIB_MAXIMUM_THREADS=1   # Accelerate's BLAS inside our threads
 for order in col row; do
     D=$R/$order
     mkdir -p "$D"
+    pause
     ./bench-potrf sme $F --threads=auto --order=$order "$@" > "$D/mojo.txt"
+    pause
     ./bench-potrf accelerate-blas $F --threads=auto --order=$order "$@" \
         > "$D/mojo-accelerate-blas.txt"
+    pause
     ./bench-potrf "$ACCELERATE" $F --order=$order "$@" > "$D/accelerate.txt"
+    if [ -n "$OPENBLAS" ]; then
+        pause
+        ./bench-potrf "$OPENBLAS" $F --order=$order "$@" > "$D/openblas.txt"
+        pause
+        OPENBLAS_NUM_THREADS=1 ./bench-potrf "$OPENBLAS" $F --order=$order \
+            "$@" > "$D/openblas-1.txt"
+    fi
 done
 if [ -n "$NUMAX" ]; then
     "$NUMAX" "$@" > $R/numax.txt

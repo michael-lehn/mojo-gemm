@@ -2,7 +2,8 @@
 # A = L L^T (or U^T U).
 #
 #   ./bench-potrf IMPL [--float] [--uplo=L|U] [--order=row|col]
-#                      [--threads=T] [--nb=NB] [n ...]
+#                      [--threads=T] [--nb=NB] [--pk | --pk3 [--w=W]]
+#                      [n ...]
 #
 #   IMPL   neon        Mojo potrf, Mojo BLAS with NEON micro kernel
 #          sme         Mojo potrf, Mojo BLAS with SME2 micro kernel
@@ -13,6 +14,8 @@
 #                      dpotrf$NEWLAPACK)
 #   --threads, --nb    threads and tile size of the Mojo potrf;
 #                      --threads=auto: both from potrf_select (tuning)
+#   --pk, --pk3        potrf_pk (pack once) or potrf_pk3 (with lookahead on
+#                      two threads, reading L once for W block columns)
 #   defaults: lower, column major, 1 thread, nb = 256,
 #             n = 50, 100, ..., 4000
 #
@@ -42,7 +45,8 @@ def main() raises:
     if len(args) < 2:
         print("usage: bench-potrf neon|sme|accelerate-blas|PATH [--float]",
               "[--uplo=L|U]",
-              "[--order=row|col] [--threads=T|auto] [--nb=NB] [n ...]")
+              "[--order=row|col] [--threads=T|auto] [--nb=NB]",
+              "[--pk | --pk3 [--w=W]] [n ...]")
         return
     var impl = String(args[1])
     var lower = True
@@ -51,6 +55,7 @@ def main() raises:
     var nb = 256
     var pkmode = 0  # --pk: pack once, left-looking (small n, SME2);
     # --pk3: the same with lookahead on two threads
+    var w = 1  # --w=W: potrf_pk3 reads L once for W block columns
     var sizes = List[Int]()
     var single = False
     for i in range(2, len(args)):
@@ -71,6 +76,8 @@ def main() raises:
             nthreads = Int(a[byte=10:])
         elif a.startswith("--nb="):
             nb = Int(a[byte=5:])
+        elif a.startswith("--w="):
+            w = Int(a[byte=4:])
         else:
             sizes.append(Int(a))
     if len(sizes) == 0:
@@ -83,13 +90,14 @@ def main() raises:
     )
 
     if single:
-        run[DType.float32](impl, lower, row, nthreads, nb, pkmode, sizes)
+        run[DType.float32](impl, lower, row, nthreads, nb, pkmode, w, sizes)
     else:
-        run[DType.float64](impl, lower, row, nthreads, nb, pkmode, sizes)
+        run[DType.float64](impl, lower, row, nthreads, nb, pkmode, w, sizes)
 
 
 def run[dt: DType](
     impl: String, lower: Bool, row: Bool, nthreads: Int, nb: Int, pkmode: Int,
+    w: Int,
     sizes: List[Int],
 ) raises:
     comptime single = dt == DType.float32
@@ -118,6 +126,8 @@ def run[dt: DType](
     else:
         var slash = impl.rfind("/")
         print(String("# ", symbol, " of ", impl[byte=slash + 1 :]))
+    if pkmode == 3:
+        print(String("# potrf_pk3, w = ", w))
     print("# n seconds GFLOP/s check")
 
     seed(1)
@@ -154,7 +164,7 @@ def run[dt: DType](
                     if pkmode == 1:
                         info = potrf_pk(n, raw(A), r, c, pkb)
                     else:
-                        info = potrf_pk3(n, raw(A), r, c, pkb)
+                        info = potrf_pk3(n, raw(A), r, c, pkb, w)
                 elif kind == 0:
                     info = potrf[False, 0, dt](lower, n, raw(A), incRow,
                                                incCol, pkb, nb, nthreads)

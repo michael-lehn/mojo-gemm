@@ -4,7 +4,8 @@
 # potrf_select[SME, ACC, dt](n) -> (algorithm, nthreads, nb): the
 # configuration potrf uses for nthreads = 0.  Algorithm: 0 tiles
 # and tasks, 1 pack once (potrf_pk), 2 pack once with lookahead
-# (potrf_pk3).
+# (potrf_pk3); for potrf_pk3 nb is the number of block
+# columns per pass over L.
 
 
 def potrf_select[SME: Bool, ACC: Int, dt: DType = DType.float64](n: Int) -> Tuple[
@@ -14,64 +15,80 @@ def potrf_select[SME: Bool, ACC: Int, dt: DType = DType.float64](n: Int) -> Tupl
         comptime if SME and ACC == 0:
             if n <= 75:  # pk, n >= 0
                 return (1, 1, 0)
-            return (2, 2, 0)  # pk3, n >= 76
+            if n <= 3625:  # pk3, n >= 76
+                return (2, 2, 1)
+            return (2, 2, 2)  # pk3, n >= 3626
         comptime if SME and ACC == 1:
-            if n <= 175:  # tiles, n >= 0
+            if n <= 75:  # tiles, n >= 0
                 return (0, 1, 4096)
-            if n <= 275:  # tiles, n >= 176
-                return (0, 1, 256)
-            if n <= 575:  # tiles, n >= 276
+            if n <= 175:  # tiles, n >= 76
                 return (0, 1, 512)
+            if n <= 450:  # tiles, n >= 176
+                return (0, 1, 4096)
+            if n <= 575:  # tiles, n >= 451
+                return (0, 1, 256)
             if n <= 725:  # tiles, n >= 576
                 return (0, 3, 128)
-            if n <= 1125:  # tiles, n >= 726
+            if n <= 900:  # tiles, n >= 726
                 return (0, 2, 256)
-            if n <= 2750:  # tiles, n >= 1126
+            if n <= 1125:  # tiles, n >= 901
+                return (0, 3, 128)
+            if n <= 1375:  # tiles, n >= 1126
                 return (0, 3, 256)
-            if n <= 3250:  # tiles, n >= 2751
-                return (0, 4, 384)
-            return (0, 4, 512)  # tiles, n >= 3251
+            if n <= 1625:  # tiles, n >= 1376
+                return (0, 2, 384)
+            if n <= 1875:  # tiles, n >= 1626
+                return (0, 4, 256)
+            if n <= 2125:  # tiles, n >= 1876
+                return (0, 3, 256)
+            if n <= 3125:  # tiles, n >= 2126
+                return (0, 4, 256)
+            if n <= 3375:  # tiles, n >= 3126
+                return (0, 3, 384)
+            return (0, 4, 512)  # tiles, n >= 3376
     comptime if SME and ACC == 0:
         if n <= 75:  # pk, n >= 0
             return (1, 1, 0)
-        if n <= 2750:  # pk3, n >= 76
-            return (2, 2, 0)
-        if n <= 3250:  # pk, n >= 2751
-            return (1, 1, 0)
-        if n <= 3750:  # tiles, n >= 3251
-            return (0, 3, 256)
-        return (0, 4, 256)  # tiles, n >= 3751
+        if n <= 3125:  # pk3, n >= 76
+            return (2, 2, 1)
+        if n <= 3375:  # pk3, n >= 3126
+            return (2, 2, 2)
+        if n <= 3625:  # pk3, n >= 3376
+            return (2, 2, 1)
+        if n <= 3875:  # pk3, n >= 3626
+            return (2, 2, 2)
+        return (2, 2, 1)  # pk3, n >= 3876
     comptime if SME and ACC == 1:
-        if n <= 75:  # tiles, n >= 0
-            return (0, 1, 512)
-        if n <= 175:  # tiles, n >= 76
+        if n <= 125:  # tiles, n >= 0
+            return (0, 1, 4096)
+        if n <= 175:  # tiles, n >= 126
             return (0, 1, 256)
         if n <= 225:  # tiles, n >= 176
             return (0, 1, 512)
         if n <= 275:  # tiles, n >= 226
-            return (0, 1, 4096)
+            return (0, 1, 256)
         if n <= 350:  # tiles, n >= 276
-            return (0, 1, 512)
-        if n <= 450:  # tiles, n >= 351
             return (0, 1, 4096)
+        if n <= 450:  # tiles, n >= 351
+            return (0, 1, 512)
         if n <= 575:  # tiles, n >= 451
             return (0, 2, 128)
-        if n <= 725:  # tiles, n >= 576
-            return (0, 4, 128)
-        if n <= 1125:  # tiles, n >= 726
+        if n <= 900:  # tiles, n >= 576
+            return (0, 3, 128)
+        if n <= 1125:  # tiles, n >= 901
             return (0, 2, 256)
         if n <= 1375:  # tiles, n >= 1126
-            return (0, 4, 128)
+            return (0, 3, 128)
         if n <= 1875:  # tiles, n >= 1376
             return (0, 3, 256)
-        if n <= 2250:  # tiles, n >= 1876
-            return (0, 4, 128)
-        if n <= 2750:  # tiles, n >= 2251
-            return (0, 2, 384)
-        if n <= 3250:  # tiles, n >= 2751
-            return (0, 4, 512)
-        if n <= 3750:  # tiles, n >= 3251
+        if n <= 2125:  # tiles, n >= 1876
+            return (0, 2, 128)
+        if n <= 2375:  # tiles, n >= 2126
+            return (0, 10, 384)
+        if n <= 2875:  # tiles, n >= 2376
             return (0, 2, 512)
-        return (0, 4, 512)  # tiles, n >= 3751
+        if n <= 3375:  # tiles, n >= 2876
+            return (0, 4, 512)
+        return (0, 2, 512)  # tiles, n >= 3376
     # not tuned (other backends, or no tuning data)
     return (0, 1, 4096) if n <= 1000 else (0, 4, 256)

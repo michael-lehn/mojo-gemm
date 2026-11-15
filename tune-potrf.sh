@@ -22,7 +22,7 @@ if [ "$1" = "--float" ]; then
     PREFIX=tune-potrf/float
 fi
 pixi run build-potrf
-N="50 100 150 200 250 300 400 500 650 800 1000 1250 1500 1750 2000 2500 3000 3500 4000"
+N="50 100 150 200 250 300 400 500 650 800 1000 1250 1500 1750 2000 2250 2500 2750 3000 3250 3500 3750 4000"
 PCORES=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo 4)
 ALL=$(sysctl -n hw.physicalcpu 2>/dev/null || echo 4)
 THREADS="2 3 $PCORES $ALL"
@@ -34,7 +34,9 @@ for backend in sme accelerate-blas; do
     if [ $backend = sme ]; then
         echo "$backend: pack once, pack once with lookahead"
         ./bench-potrf sme $F --pk $N > "$D/pk.txt"
-        ./bench-potrf sme $F --pk3 $N > "$D/pk3.txt"
+        for w in 1 2 3; do
+            ./bench-potrf sme $F --pk3 --w=$w $N > "$D/pk3-w$w.txt"
+        done
     fi
     for nb in 256 512 4096; do
         echo "$backend: 1 thread, nb = $nb"

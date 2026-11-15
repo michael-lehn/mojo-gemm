@@ -60,9 +60,10 @@ def check[SME: Bool, ACC: Int, PK: Int, dt: DType](
     comptime if PK == 1:
         var pkb = PotrfContext[dt]()
         info = potrf_pk(n, raw(A), r if lower else c, c if lower else r, pkb)
-    elif PK == 3:
+    elif PK >= 3:  # potrf_pk3 with w = PK - 2
         var pkb = PotrfContext[dt]()
-        info = potrf_pk3(n, raw(A), r if lower else c, c if lower else r, pkb)
+        info = potrf_pk3(n, raw(A), r if lower else c, c if lower else r, pkb,
+                         PK - 2)
     else:
         info = potrf[SME, ACC, dt](lower, n, raw(A), r, c, nb, nthreads)
     if info != 0:
@@ -119,9 +120,9 @@ def check_info[SME: Bool, ACC: Int, PK: Int, dt: DType](
     comptime if PK == 1:
         var pkb = PotrfContext[dt]()
         info = potrf_pk(n, raw(A), 1, n, pkb)
-    elif PK == 3:
+    elif PK >= 3:
         var pkb = PotrfContext[dt]()
-        info = potrf_pk3(n, raw(A), 1, n, pkb)
+        info = potrf_pk3(n, raw(A), 1, n, pkb, PK - 2)
     else:
         info = potrf[SME, ACC, dt](True, n, raw(A), 1, n, nb, nthreads)
     _ = A^  # A must live until here (potrf only got a raw pointer)
@@ -195,8 +196,10 @@ def dispatch[dt: DType](kernel: String) raises:
         print("potrf_pk (pack once), sme micro kernel")
         run_pk[1, dt]()
     elif kernel == "pk3":
-        print("potrf_pk3 (pack once, lookahead, persistent thread)")
+        print("potrf_pk3 (pack once, lookahead, persistent thread), w = 1, 2, 3")
         run_pk[3, dt]()
+        run_pk[4, dt]()
+        run_pk[5, dt]()
     elif kernel == "accelerate":
         print("potrf, BLAS of Accelerate")
         run[True, 1, dt]()
