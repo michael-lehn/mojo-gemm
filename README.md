@@ -1278,9 +1278,13 @@ What I missed in this experiment (Mojo 1.2):
 - No threads in the standard library.  potrf uses `sync_parallelize` of
   MAX, and its persistent worker thread is a pthread created through the
   FFI (foreign function interface).
-- For SME: `llvm.arm_new_za` has no effect, so ZA (the matrix storage of
-  SME) is switched on by hand, and SIMD code in streaming mode is compiled
-  to 128-bit vectors only.
+- For SME: SIMD code in streaming mode is compiled to 128-bit vectors
+  only.  (An earlier version said here that `llvm.arm_new_za` has no
+  effect.  That was wrong: the compiler switches ZA on only in a function
+  that visibly uses it, so inline assembly that uses ZA has to list
+  `~{za}` among its clobbers.  The kernels now do that and no longer
+  switch ZA on by hand, which also skipped the lazy save of a caller's ZA
+  content that the calling convention asks for.)
 - No LAPACK-level operations in MAX.
 
 ## Files and how to run

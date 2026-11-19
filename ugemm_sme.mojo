@@ -34,12 +34,14 @@
 #   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
-# The kernel is inline assembly.  ugemm_sme enters and leaves streaming mode
-# and ZA inside the assembly block (smstart/smstop), for every tile.
-# mgemm_sme, the macro kernel, is a streaming function instead
-# (@__llvm_metadata(`llvm.arm_streaming`); the caller switches the mode) and
-# switches ZA on and off itself: once per call of the macro kernel, the
-# assembly block of the micro kernel does not switch.
+# The kernel is inline assembly.  Every function that runs SME code is a
+# streaming function with its own ZA state
+# (@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)): the compiler
+# switches the mode at its call and, because the assembly blocks list ZA as
+# clobbered (~{za}), switches ZA on and off in it, after saving the ZA
+# content of a caller if the calling convention asks for it (lazy save,
+# TPIDR2_EL0).  ugemm_sme does this for every tile (kernel_32x16), the
+# macro kernel mgemm_sme once per call.
 #
 # The 32 x 16 tile of C is held transposed in the eight 8 x 8 tiles
 # ZA0.D ... ZA7.D (SVL = 512 bits): tile ZA(i + 4j) holds rows 8i ... 8i+7
@@ -74,8 +76,10 @@ def fpsr_set(value: UInt64):
 comptime MR_SME = 32
 comptime NR_SME = 16
 
-# Streaming mode and ZA are entered and left inside the assembly block
-# (smstart/smstop): every vector and predicate register is clobbered.
+# Everything an assembly block may change besides its operands: every
+# vector and predicate register, and ZA.  ~{za} tells the compiler that the
+# block uses ZA; without it a function with llvm.arm_new_za gets no ZA
+# setup (no smstart za), and the first ZA instruction raises SIGILL.
 comptime CLOBBERS = (
     "~{x9},~{x10},~{x11},~{x12},~{x13},~{x14},~{x15},~{x16},~{x17}"
     ",~{memory},~{cc}"
@@ -85,7 +89,7 @@ comptime CLOBBERS = (
     ",~{v24},~{v25},~{v26},~{v27},~{v28},~{v29},~{v30},~{v31}"
     ",~{p0},~{p1},~{p2},~{p3},~{p4},~{p5},~{p6},~{p7}"
     ",~{p8},~{p9},~{p10},~{p11},~{p12},~{p13},~{p14},~{p15}"
-    ",~{ffr},~{fpmr}"
+    ",~{ffr},~{fpmr},~{za}"
 )
 
 # Operands: $0 kc (>= 1), $1 A panel, $2 B panel, $3 C, $4 ldC in bytes,
@@ -150,8 +154,6 @@ comptime KERNEL_S_TAIL = """    subs x11, x11, #1
     b.lt 3b
 """
 comptime KERNEL_S = KERNEL_S_HEAD + "    add x10, x10, #128\n" + KERNEL_S_TAIL
-# with the mode switches, for ordinary (non-streaming) callers
-comptime KERNEL = "    smstart\n" + KERNEL_S + "    smstop\n"
 
 
 
@@ -253,11 +255,12 @@ def kernel_partial_s(kc: Int, A: Ptr, B: Ptr, C: Ptr, ldC: Int, mr: Int,
     ](kc, A, B, C, ldC * 8, mr, nr, Int(load_c))
 
 
-@always_inline
+# One tile for ordinary (non-streaming) callers: the call switches the mode
+# and ZA.
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
+@no_inline
 def kernel_32x16(kc: Int, A: Ptr, B: Ptr, C: Ptr, ldC: Int, load_c: Bool):
-    inlined_assembly[
-        KERNEL, NoneType, constraints="r,r,r,r,r,r,r," + CLOBBERS
-    ](kc, A, B, C, ldC * 8, ldC * 64, Int(load_c))
+    kernel_32x16_s(kc, A, B, C, ldC, load_c)
 
 
 # The interface of the Mojo micro kernels (see ugemm in gemm.mojo):
@@ -298,7 +301,7 @@ def ugemm_sme(
 # gemm.mojo.  With incRowC = 1 and beta 0 or 1 (the case gemm arranges) the
 # tiles are computed in place, partial ones with predicates; otherwise
 # through a local tile.
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def mgemm_sme(
     mc: Int, nc: Int, kc: Int, A_: Ptr, B_: Ptr, beta: Float64, C: Ptr,
@@ -307,8 +310,6 @@ def mgemm_sme(
     var T = Array[Float64, MR_SME * NR_SME](uninitialized=True)
     var T_ = T.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
     var direct_ok = incRowC == 1 and (beta == 0.0 or beta == 1.0)
-    # llvm.arm_new_za has no effect in Mojo 1.2.0: ZA is switched on here
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     comptime pf = PrefetchOptions().for_write().medium_locality()
     var jr = 0
     while jr < nc:
@@ -343,7 +344,6 @@ def mgemm_sme(
                         cij[] = v
             ir += MR_SME
         jr += NR_SME
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
 
@@ -491,7 +491,7 @@ comptime NR_SME32 = 32
 
 
 # Macro kernel for float in streaming mode, as mgemm_sme.
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def mgemm_sme32(
     mc: Int, nc: Int, kc: Int, A_: PtrF, B_: PtrF, beta: Float32, C: PtrF,
@@ -500,7 +500,6 @@ def mgemm_sme32(
     var T = Array[Float32, MR_SME32 * NR_SME32](uninitialized=True)
     var T_ = T.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
     var direct_ok = incRowC == 1 and (beta == 0.0 or beta == 1.0)
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     comptime pf = PrefetchOptions().for_write().medium_locality()
     var jr = 0
     while jr < nc:
@@ -532,7 +531,6 @@ def mgemm_sme32(
                         cij[] = v
             ir += MR_SME32
         jr += NR_SME32
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
 comptime PF32 = True  # prefetch the tile of C below (as for double)
@@ -542,11 +540,10 @@ comptime PF32 = True  # prefetch the tile of C below (as for double)
 # (ulmblas/level3/ukernel/sme/spack.tcc): ZA as transpose buffer.  Per 16
 # values of k the 32 rows of X (row c: k floats at X + c*incX) are loaded
 # into the horizontal slices of ZA0.S (rows 0 .. 15) and ZA1.S (16 .. 31),
-# the vertical slices are the 32 elements per k.  Enters and leaves
-# streaming mode itself.
+# the vertical slices are the 32 elements per k.  A streaming function with
+# its own ZA: the call switches the mode and ZA.
 # Operands: $0 k (>= 1), $1 X, $2 incX in bytes, $3 buffer.
 comptime PACK32_T = """
-    smstart
     ptrue p0.s
     zero {za}
     mov x9, $1
@@ -584,11 +581,11 @@ comptime PACK32_T = """
     add x11, x11, #16
     b 1b
 9:
-    smstop
 """
 
 
-@always_inline
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
+@no_inline
 def pack32_transpose(k: Int, X: PtrF, incX: Int, buffer: PtrF):
     inlined_assembly[
         PACK32_T, NoneType, constraints="r,r,r,r," + CLOBBERS
@@ -801,10 +798,9 @@ def pk_offset(P: Int) -> Int:
 # on if P0 >= 0):
 # T(P) = C(P, K) - L(P, 0:32K) L(K, 0:32K)^T, T(P) at T + (P-K)*1024.  Both
 # operands are the panels themselves (no packing).
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_update(buf: Ptr, T: Ptr, K: Int, np: Int, P0: Int = -1):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     var kc = 32 * K
     var Bk = buf.unsafe_offset(pk_offset(K))
     for P in range(K if P0 < 0 else P0, np):
@@ -814,23 +810,20 @@ def pk_update(buf: Ptr, T: Ptr, K: Int, np: Int, P0: Int = -1):
         kernel_pk_upd(kc, Ap, Bk, C, Tp)
         kernel_pk_upd(kc, Ap, Bk.unsafe_offset(16), C.unsafe_offset(512),
                       Tp.unsafe_offset(512))
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
 # Solve below the diagonal block of block column K: C(P, K) = T(P) Linv^T
 # for P = K+1 .. np-1 (from P0 on if P0 >= 0), Linv the inverse of the
 # diagonal block (column major,
 # leading dimension 32).
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_solve(buf: Ptr, T: Ptr, Linv: Ptr, K: Int, np: Int, P0: Int = -1):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     for P in range(K + 1 if P0 < 0 else P0, np):
         var C = buf.unsafe_offset(pk_offset(P) + K * 1024)
         var Tp = T.unsafe_offset((P - K) * 1024)
         kernel_pk_slv(32, Tp, Linv, C)
         kernel_pk_slv(32, Tp, Linv.unsafe_offset(16), C.unsafe_offset(512))
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
 # ---------------------------------------------------------------------------
@@ -991,28 +984,24 @@ def kernel32_pk_slv(kc: Int, A: PtrF, B: PtrF, C: PtrF):
 
 
 # pk_update and pk_solve for float (see there)
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_update32(buf: PtrF, T: PtrF, K: Int, np: Int, P0: Int = -1):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     var kc = 32 * K
     var Bk = buf.unsafe_offset(pk_offset(K))
     for P in range(K if P0 < 0 else P0, np):
         var Ap = buf.unsafe_offset(pk_offset(P))
         kernel32_pk_upd(kc, Ap, Bk, Ap.unsafe_offset(K * 1024),
                         T.unsafe_offset((P - K) * 1024))
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_solve32(buf: PtrF, T: PtrF, Linv: PtrF, K: Int, np: Int,
                P0: Int = -1):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     for P in range(K + 1 if P0 < 0 else P0, np):
         kernel32_pk_slv(32, T.unsafe_offset((P - K) * 1024), Linv,
                         buf.unsafe_offset(pk_offset(P) + K * 1024))
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
 # ---------------------------------------------------------------------------
@@ -1027,11 +1016,10 @@ def pk_solve32(buf: PtrF, T: PtrF, Linv: PtrF, K: Int, np: Int,
 # pk_correct: T(c)(P) -= L(P, s0:s1) L(c, s0:s1)^T (block columns s0 ..
 # s1-1, kc = 32 (s1 - s0)) for c = c0 .. c1-1 and P = P0 .. P1-1, P >= c.
 # ---------------------------------------------------------------------------
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_update_w(buf: Ptr, Tb: Ptr, TS: Int, nT: Int, K: Int, c1: Int,
                 P0: Int, P1: Int):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     var kc = 32 * K
     for P in range(P0, P1):
         var Ap = buf.unsafe_offset(pk_offset(P))
@@ -1052,14 +1040,12 @@ def pk_update_w(buf: Ptr, Tb: Ptr, TS: Int, nT: Int, K: Int, c1: Int,
                              pf.unsafe_offset((j + 1) * kc * stride // 8),
                              stride)
             j += 2
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_correct(buf: Ptr, Tb: Ptr, TS: Int, nT: Int, s0: Int, s1: Int,
                c0: Int, c1: Int, P0: Int, P1: Int):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     var kc = 32 * (s1 - s0)
     for P in range(P0, P1):
         var Ap = buf.unsafe_offset(pk_offset(P) + s0 * 1024)
@@ -1069,14 +1055,12 @@ def pk_correct(buf: Ptr, Tb: Ptr, TS: Int, nT: Int, s0: Int, s1: Int,
             kernel_pk_upd(kc, Ap, Bc, Tp, Tp)
             kernel_pk_upd(kc, Ap, Bc.unsafe_offset(16), Tp.unsafe_offset(512),
                           Tp.unsafe_offset(512))
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_update_w32(buf: PtrF, Tb: PtrF, TS: Int, nT: Int, K: Int, c1: Int,
                   P0: Int, P1: Int):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     var kc = 32 * K
     for P in range(P0, P1):
         var Ap = buf.unsafe_offset(pk_offset(P))
@@ -1092,14 +1076,12 @@ def pk_update_w32(buf: PtrF, Tb: PtrF, TS: Int, nT: Int, K: Int, c1: Int,
                                Tb.unsafe_offset((c % nT) * TS + (P - c) * 1024),
                                pf.unsafe_offset(j * kc * stride // 4), stride)
             j += 1
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
 
 
-@__llvm_metadata(`llvm.arm_streaming`)
+@__llvm_metadata(`llvm.arm_streaming`, `llvm.arm_new_za`)
 @no_inline
 def pk_correct32(buf: PtrF, Tb: PtrF, TS: Int, nT: Int, s0: Int, s1: Int,
                  c0: Int, c1: Int, P0: Int, P1: Int):
-    inlined_assembly["smstart za", NoneType, constraints="~{memory}"]()
     var kc = 32 * (s1 - s0)
     for P in range(P0, P1):
         var Ap = buf.unsafe_offset(pk_offset(P) + s0 * 1024)
@@ -1108,4 +1090,3 @@ def pk_correct32(buf: PtrF, Tb: PtrF, TS: Int, nT: Int, s0: Int, s1: Int,
             kernel32_pk_upd(kc, Ap,
                             buf.unsafe_offset(pk_offset(c) + s0 * 1024), Tp,
                             Tp)
-    inlined_assembly["smstop za", NoneType, constraints="~{memory}"]()
